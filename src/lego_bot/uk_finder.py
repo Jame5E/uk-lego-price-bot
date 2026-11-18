@@ -384,6 +384,171 @@ async def _fetch_brickwatch_uk(
     return offers, (None if offers else "BrickWatch UK: no active GBP offers found")
 
 
+async def _fetch_brickset_uk_offers(
+    session: aiohttp.ClientSession,
+    set_number: str,
+    *,
+    has_amazon_prime: bool = False,
+    prefer_click_and_collect: bool = False,
+) -> tuple[list[UKOffer], str | None]:
+    """Extract UK retailer prices (e.g. Amazon UK, LEGO.com, Zavvi) from Brickset set page."""
+    clean_num = set_number.strip().split("-")[0]
+    url = f"https://brickset.com/sets/{clean_num}-1"
+    try:
+        async with session.get(url, headers=DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+            if resp.status != 200:
+                return [], f"Brickset UK: HTTP {resp.status}"
+            html = await resp.text()
+    except Exception as exc:
+        return [], f"Brickset UK: {exc}"
+
+    soup = BeautifulSoup(html, "html.parser")
+    offers: list[UKOffer] = []
+    retailer_map = {
+        "amazon.co.uk": UKRetailer.AMAZON_UK,
+        "amazon uk": UKRetailer.AMAZON_UK,
+        "lego.com": UKRetailer.LEGO_UK,
+        "argos": UKRetailer.ARGOS,
+        "smyths": UKRetailer.SMYTHS,
+        "john lewis": UKRetailer.JOHN_LEWIS,
+    }
+
+    for node in soup.find_all(["tr", "li", "div", "a"]):
+        txt = node.get_text(" ", strip=True)
+        if "£" not in txt or len(txt) > 160:
+            continue
+        lower = txt.lower()
+        if any(p in lower for p in OUT_OF_STOCK_PHRASES) or "rrp" in lower:
+            continue
+        matched = None
+        for kw, ret in retailer_map.items():
+            if kw in lower:
+                matched = ret
+                break
+        if matched is None:
+            continue
+        m = re.search(r"£\s*(\d{1,4}\.\d{2})", txt)
+        if not m:
+            continue
+        price = round(float(m.group(1)), 2)
+        if price <= 0:
+            continue
+        ship = estimate_uk_shipping(
+            price,
+            matched,
+            has_amazon_prime=has_amazon_prime,
+            prefer_click_and_collect=prefer_click_and_collect,
+        )
+        offers.append(
+            UKOffer(
+                retailer=matched,
+                url=url,
+                item_price_gbp=price,
+                shipping_gbp=ship.shipping_gbp,
+                total_gbp=ship.total_gbp,
+                shipping_note=ship.note,
+            )
+        )
+
+    return offers, (None if offers else "Brickset UK: no live retailer prices listed")
+
+
+async def _fetch_pricerunner_uk(
+    session: aiohttp.ClientSession,
+    set_number: str,
+) -> tuple[list[UKOffer], str | None]:
+    """Query PriceRunner UK search for GBP LEGO prices."""
+    clean_num = set_number.strip().split("-")[0]
+    url = f"https://www.pricerunner.com/results?q=lego+{clean_num}"
+    try:
+        async with session.get(url, headers=DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+            if resp.status != 200:
+                return [], f"PriceRunner UK: HTTP {resp.status}"
+            html = await resp.text()
+    except Exception as exc:
+        return [], f"PriceRunner UK: {exc}"
+
+    price = extract_first_gbp_price_from_search(html, clean_num)
+    if price is None:
+        return [], "PriceRunner UK: no matching GBP price found"
+    ship = estimate_uk_shipping(price, UKRetailer.OTHER)
+    return [
+        UKOffer(
+            retailer=UKRetailer.OTHER,
+            url=url,
+            item_price_gbp=price,
+            shipping_gbp=ship.shipping_gbp,
+            total_gbp=ship.total_gbp,
+            shipping_note=ship.note,
+        )
+    ], None
+
+
+async def _check_retailer_url(
+    session: aiohttp.ClientSession,
+    retailer: UKRetailer,
+    url: str,
+    *,
+    set_number: str | None,
+    has_amazon_prime: bool,
+    prefer_click_and_collect: bool,
+    keepa_api_key: str | None,
+) -> tuple[list[UKOffer], str | None]:
+    if retailer == UKRetailer.LEGO_UK:
+        res = await fetch_price_for_url(session, url, keepa_api_key=keepa_api_key)
+        if res.ok and res.quote is not None:
+            if not res.quote.in_stock:
+                return [], "LEGO.com UK: out of stock"
+            ship = estimate_uk_shipping(
+                res.quote.price_gbp,
+                retailer,
+                has_amazon_prime=has_amazon_prime,
+                prefer_click_and_collect=prefer_click_and_collect,
+            )
+            return [
+                UKOffer(
+                    retailer=retailer,
+                    url=url,
+                    item_price_gbp=res.quote.price_gbp,
+                    shipping_gbp=ship.shipping_gbp,
+                    total_gbp=ship.total_gbp,
+                    shipping_note=ship.note,
+                )
+            ], None
+        return [], f"{retailer.display_name}: {res.error}"
+
+    try:
+        async with session.get(
+            url, headers=DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=8)
+        ) as resp:
+            if resp.status != 200:
+                return [], f"{retailer.display_name}: HTTP {resp.status}"
+            html = await resp.text()
+    except Exception as exc:
+        return [], f"{retailer.display_name}: {type(exc).__name__}"
+
+    price = extract_first_gbp_price_from_search(html, set_number)
+    if price is None:
+        return [], f"{retailer.display_name}: no price found"
+
+    ship = estimate_uk_shipping(
+        price,
+        retailer,
+        has_amazon_prime=has_amazon_prime,
+        prefer_click_and_collect=prefer_click_and_collect,
+    )
+    return [
+        UKOffer(
+            retailer=retailer,
+            url=url,
+            item_price_gbp=price,
+            shipping_gbp=ship.shipping_gbp,
+            total_gbp=ship.total_gbp,
+            shipping_note=ship.note,
+        )
+    ], None
+
+
 async def find_best_uk_offer(
     session: aiohttp.ClientSession,
     *,
@@ -394,34 +559,56 @@ async def find_best_uk_offer(
     prefer_click_and_collect: bool = False,
     keepa_api_key: str | None = None,
 ) -> tuple[UKOffer | None, list[str]]:
-    """Check direct URL or multiple UK retailers and return the cheapest in-stock landed offer."""
+    """Check direct URL or multiple UK retailers concurrently and return the cheapest in-stock landed offer."""
     offers: list[UKOffer] = []
     notes: list[str] = []
 
+    tasks = []
     if set_number:
-        bw_offers, bw_err = await _fetch_brickwatch_uk(
-            session,
-            set_number,
-            has_amazon_prime=has_amazon_prime,
-            prefer_click_and_collect=prefer_click_and_collect,
+        tasks.append(
+            _fetch_brickset_uk_offers(
+                session,
+                set_number,
+                has_amazon_prime=has_amazon_prime,
+                prefer_click_and_collect=prefer_click_and_collect,
+            )
         )
-        offers.extend(bw_offers)
-        if bw_err:
-            notes.append(bw_err)
+        tasks.append(
+            _fetch_brickwatch_uk(
+                session,
+                set_number,
+                has_amazon_prime=has_amazon_prime,
+                prefer_click_and_collect=prefer_click_and_collect,
+            )
+        )
+        tasks.append(_fetch_pricerunner_uk(session, set_number))
+
+    for retailer, url in build_uk_search_urls(name, set_number):
+        tasks.append(
+            _check_retailer_url(
+                session,
+                retailer,
+                url,
+                set_number=set_number,
+                has_amazon_prime=has_amazon_prime,
+                prefer_click_and_collect=prefer_click_and_collect,
+                keepa_api_key=keepa_api_key,
+            )
+        )
 
     if direct_url:
-        res = await fetch_price_for_url(session, direct_url, keepa_api_key=keepa_api_key)
-        if res.ok and res.quote is not None:
-            if not res.quote.in_stock:
-                notes.append(f"Direct URL ({res.quote.retailer.display_name}): out of stock (skipped)")
-            else:
+        async def _check_direct() -> tuple[list[UKOffer], str | None]:
+            res = await fetch_price_for_url(session, direct_url, keepa_api_key=keepa_api_key)
+            if res.ok and res.quote is not None:
+                if not res.quote.in_stock:
+                    return [], f"Direct URL ({res.quote.retailer.display_name}): out of stock"
                 ship = estimate_uk_shipping(
                     res.quote.price_gbp,
                     res.quote.retailer,
                     has_amazon_prime=has_amazon_prime,
                     prefer_click_and_collect=prefer_click_and_collect,
                 )
-                offers.append(
+                return [
                     UKOffer(
                         retailer=res.quote.retailer,
                         url=direct_url,
@@ -432,70 +619,20 @@ async def find_best_uk_offer(
                         historical_low_gbp=res.quote.historical_low_gbp,
                         historical_avg_gbp=res.quote.historical_avg_gbp,
                     )
-                )
-        else:
-            notes.append(f"Direct URL: {res.error}")
+                ], None
+            return [], f"Direct URL: {res.error}"
 
-    for retailer, url in build_uk_search_urls(name, set_number):
-        if retailer == UKRetailer.LEGO_UK:
-            res = await fetch_price_for_url(session, url, keepa_api_key=keepa_api_key)
-            if res.ok and res.quote is not None:
-                if not res.quote.in_stock:
-                    notes.append("LEGO.com UK: out of stock (skipped)")
-                else:
-                    ship = estimate_uk_shipping(
-                        res.quote.price_gbp,
-                        retailer,
-                        has_amazon_prime=has_amazon_prime,
-                        prefer_click_and_collect=prefer_click_and_collect,
-                    )
-                    offers.append(
-                        UKOffer(
-                            retailer=retailer,
-                            url=url,
-                            item_price_gbp=res.quote.price_gbp,
-                            shipping_gbp=ship.shipping_gbp,
-                            total_gbp=ship.total_gbp,
-                            shipping_note=ship.note,
-                        )
-                    )
-            else:
-                notes.append(f"{retailer.display_name}: {res.error}")
+        tasks.append(_check_direct())
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for item in results:
+        if isinstance(item, Exception):
+            notes.append(f"Check error: {type(item).__name__}")
             continue
-
-        try:
-            async with session.get(
-                url, headers=DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=12)
-            ) as resp:
-                if resp.status != 200:
-                    notes.append(f"{retailer.display_name}: HTTP {resp.status}")
-                    continue
-                html = await resp.text()
-        except Exception as exc:
-            notes.append(f"{retailer.display_name}: {exc}")
-            continue
-
-        price = extract_first_gbp_price_from_search(html, set_number)
-        if price is None:
-            notes.append(f"{retailer.display_name}: no in-stock GBP price found")
-            continue
-
-        ship = estimate_uk_shipping(
-            price,
-            retailer,
-            has_amazon_prime=has_amazon_prime,
-            prefer_click_and_collect=prefer_click_and_collect,
-        )
-        offers.append(
-            UKOffer(
-                retailer=retailer,
-                url=url,
-                item_price_gbp=price,
-                shipping_gbp=ship.shipping_gbp,
-                total_gbp=ship.total_gbp,
-                shipping_note=ship.note,
-            )
-        )
+        found_offers, err = item
+        offers.extend(found_offers)
+        if err:
+            notes.append(err)
 
     if not offers:
         return None, notes
