@@ -260,6 +260,92 @@ def extract_first_gbp_price_from_search(html: str, set_number: str | None) -> fl
     return None
 
 
+async def _fetch_brickwatch_uk(
+    session: aiohttp.ClientSession,
+    set_number: str,
+    *,
+    has_amazon_prime: bool = False,
+    prefer_click_and_collect: bool = False,
+) -> tuple[list[UKOffer], str | None]:
+    """Query BrickWatch UK aggregator for current in-stock UK retailer prices."""
+    clean_num = set_number.strip().split("-")[0]
+    url = f"https://www.brickwatch.net/en-GB/set/{clean_num}/"
+    try:
+        async with session.get(url, headers=DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+            if resp.status != 200:
+                return [], f"BrickWatch UK: HTTP {resp.status}"
+            html = await resp.text()
+    except Exception as exc:
+        return [], f"BrickWatch UK: {exc}"
+
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(" ", strip=True)
+    offers: list[UKOffer] = []
+
+    retailer_map = {
+        "amazon": UKRetailer.AMAZON_UK,
+        "argos": UKRetailer.ARGOS,
+        "lego": UKRetailer.LEGO_UK,
+        "smyths": UKRetailer.SMYTHS,
+        "john lewis": UKRetailer.JOHN_LEWIS,
+    }
+
+    for row in soup.find_all(["tr", "div", "li"]):
+        row_text = row.get_text(" ", strip=True)
+        if "£" not in row_text or len(row_text) > 220:
+            continue
+        lower = row_text.lower()
+        if any(phrase in lower for phrase in OUT_OF_STOCK_PHRASES):
+            continue
+        matched_retailer = None
+        for kw, ret in retailer_map.items():
+            if kw in lower:
+                matched_retailer = ret
+                break
+        if matched_retailer is None:
+            continue
+        m = re.search(r"£\s*(\d{1,4}(?:\.\d{2})?)", row_text)
+        if not m:
+            continue
+        price = round(float(m.group(1)), 2)
+        if price <= 0:
+            continue
+        ship = estimate_uk_shipping(
+            price,
+            matched_retailer,
+            has_amazon_prime=has_amazon_prime,
+            prefer_click_and_collect=prefer_click_and_collect,
+        )
+        offers.append(
+            UKOffer(
+                retailer=matched_retailer,
+                url=url,
+                item_price_gbp=price,
+                shipping_gbp=ship.shipping_gbp,
+                total_gbp=ship.total_gbp,
+                shipping_note=ship.note,
+            )
+        )
+
+    if not offers and "£" in text:
+        m = re.search(r"£\s*(\d{1,4}\.\d{2})", text)
+        if m:
+            price = round(float(m.group(1)), 2)
+            ship = estimate_uk_shipping(price, UKRetailer.OTHER)
+            offers.append(
+                UKOffer(
+                    retailer=UKRetailer.OTHER,
+                    url=url,
+                    item_price_gbp=price,
+                    shipping_gbp=ship.shipping_gbp,
+                    total_gbp=ship.total_gbp,
+                    shipping_note=ship.note,
+                )
+            )
+
+    return offers, (None if offers else "BrickWatch UK: no active GBP offers found")
+
+
 async def find_best_uk_offer(
     session: aiohttp.ClientSession,
     *,
@@ -273,6 +359,17 @@ async def find_best_uk_offer(
     """Check direct URL or multiple UK retailers and return the cheapest in-stock landed offer."""
     offers: list[UKOffer] = []
     notes: list[str] = []
+
+    if set_number:
+        bw_offers, bw_err = await _fetch_brickwatch_uk(
+            session,
+            set_number,
+            has_amazon_prime=has_amazon_prime,
+            prefer_click_and_collect=prefer_click_and_collect,
+        )
+        offers.extend(bw_offers)
+        if bw_err:
+            notes.append(bw_err)
 
     if direct_url:
         res = await fetch_price_for_url(session, direct_url, keepa_api_key=keepa_api_key)
