@@ -14,9 +14,11 @@ class Config:
     check_interval_minutes: int
     alert_cooldown_hours: int
     db_path: str
+    wishlist_path: str
     has_amazon_prime: bool
     prefer_click_and_collect: bool
     keepa_api_key: str | None
+    brickset_api_key: str | None
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -42,7 +44,9 @@ class Config:
             check_interval_minutes=max(5, int(os.getenv("CHECK_INTERVAL_MINUTES", "30"))),
             alert_cooldown_hours=max(1, int(os.getenv("ALERT_COOLDOWN_HOURS", "12"))),
             db_path=os.getenv("DB_PATH", "data/lego_prices.db").strip(),
+            wishlist_path=os.getenv("WISHLIST_PATH", "wishlist.json").strip(),
             has_amazon_prime=os.getenv("HAS_AMAZON_PRIME", "false").lower() == "true",
             prefer_click_and_collect=os.getenv("PREFER_CLICK_AND_COLLECT", "false").lower() == "true",
             keepa_api_key=os.getenv("KEEPA_API_KEY", "").strip() or None,
+            brickset_api_key=os.getenv("BRICKSET_API_KEY", "").strip() or None,
         )
