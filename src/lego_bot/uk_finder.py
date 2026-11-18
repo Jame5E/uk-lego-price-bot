@@ -9,14 +9,24 @@ from urllib.parse import quote_plus
 import aiohttp
 from bs4 import BeautifulSoup
 
-from .scraper import DEFAULT_HEADERS, PriceQuote, fetch_price_for_url, parse_price_from_html
+from .scraper import DEFAULT_HEADERS, fetch_price_for_url, parse_price_from_html
 from .shipping import UKRetailer, estimate_uk_shipping
+
+OUT_OF_STOCK_PHRASES = (
+    "out of stock",
+    "currently unavailable",
+    "sold out",
+    "temporarily out of stock",
+    "no longer available",
+)
 
 
 @dataclass(frozen=True)
 class SetMetadata:
+    name: str | None
     rrp_gbp: float | None
     is_retiring: bool
+    image_url: str | None
     source: str
 
 
@@ -32,21 +42,29 @@ class UKOffer:
     historical_avg_gbp: float | None = None
 
 
+def default_box_art_url(set_number: str | None) -> str | None:
+    if not set_number:
+        return None
+    clean = set_number.strip().split("-")[0]
+    if not clean.isdigit():
+        return None
+    return f"https://images.brickset.com/sets/images/{clean}-1.jpg"
+
+
 async def lookup_set_metadata(
     session: aiohttp.ClientSession,
     set_number: str,
     *,
     brickset_api_key: str | None = None,
 ) -> SetMetadata:
-    """Auto-discover UK RRP (£) and retiring status from Brickset API or LEGO.com UK."""
+    """Auto-discover set name, UK RRP (£), box art image, and retiring status."""
     clean_num = set_number.strip().split("-")[0]
 
     if brickset_api_key:
         meta = await _lookup_brickset(session, clean_num, brickset_api_key)
-        if meta.rrp_gbp is not None:
+        if meta.rrp_gbp is not None or meta.name is not None:
             return meta
 
-    # Fallback: LEGO.com UK product page
     lego_url = f"https://www.lego.com/en-gb/product/{clean_num}"
     try:
         async with session.get(
@@ -54,18 +72,33 @@ async def lookup_set_metadata(
         ) as resp:
             if resp.status == 200:
                 html = await resp.text()
+                soup = BeautifulSoup(html, "html.parser")
                 quote = parse_price_from_html(html, lego_url)
                 retiring = "retiring soon" in html.lower()
-                if quote is not None:
+
+                og_title = soup.find("meta", attrs={"property": "og:title"})
+                og_image = soup.find("meta", attrs={"property": "og:image"})
+                name = og_title["content"].split("|")[0].strip() if og_title and og_title.get("content") else None
+                image_url = og_image["content"].strip() if og_image and og_image.get("content") else default_box_art_url(clean_num)
+
+                if quote is not None or name is not None:
                     return SetMetadata(
-                        rrp_gbp=quote.price_gbp,
+                        name=name,
+                        rrp_gbp=quote.price_gbp if quote else None,
                         is_retiring=retiring,
+                        image_url=image_url,
                         source="lego_uk",
                     )
     except Exception:
         pass
 
-    return SetMetadata(rrp_gbp=None, is_retiring=False, source="unknown")
+    return SetMetadata(
+        name=None,
+        rrp_gbp=None,
+        is_retiring=False,
+        image_url=default_box_art_url(clean_num),
+        source="fallback",
+    )
 
 
 async def _lookup_brickset(
@@ -82,19 +115,20 @@ async def _lookup_brickset(
     try:
         async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
             if resp.status != 200:
-                return SetMetadata(None, False, "brickset_error")
+                return SetMetadata(None, None, False, default_box_art_url(set_number), "brickset_error")
             data = await resp.json()
     except Exception:
-        return SetMetadata(None, False, "brickset_error")
+        return SetMetadata(None, None, False, default_box_art_url(set_number), "brickset_error")
 
     sets = data.get("sets") or []
     if not sets:
-        return SetMetadata(None, False, "brickset_empty")
+        return SetMetadata(None, None, False, default_box_art_url(set_number), "brickset_empty")
 
     s = sets[0]
     uk_data = s.get("LEGOCom", {}).get("UK", {})
     rrp = uk_data.get("retailPrice")
     exit_date_str = uk_data.get("dateLastAvailable") or s.get("exitDate")
+    image_url = s.get("image", {}).get("imageURL") or default_box_art_url(set_number)
 
     is_retiring = False
     if exit_date_str:
@@ -107,8 +141,10 @@ async def _lookup_brickset(
             pass
 
     return SetMetadata(
+        name=s.get("name"),
         rrp_gbp=round(float(rrp), 2) if rrp else None,
         is_retiring=is_retiring,
+        image_url=image_url,
         source="brickset",
     )
 
@@ -132,10 +168,9 @@ def build_uk_search_urls(name: str, set_number: str | None) -> list[tuple[UKReta
 
 
 def extract_first_gbp_price_from_search(html: str, set_number: str | None) -> float | None:
-    """Best-effort extraction of a realistic GBP price from a UK retailer search page."""
+    """Extract an in-stock GBP price from a UK retailer search page (filters out-of-stock)."""
     soup = BeautifulSoup(html, "html.parser")
 
-    # Try JSON-LD ItemList / Product first
     for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
         raw = script.string or script.get_text()
         if not raw:
@@ -154,6 +189,9 @@ def extract_first_gbp_price_from_search(html: str, set_number: str | None) -> fl
                     continue
                 offers = item.get("offers")
                 if isinstance(offers, dict) and str(offers.get("priceCurrency", "GBP")).upper() == "GBP":
+                    availability = str(offers.get("availability", "")).lower()
+                    if "outofstock" in availability:
+                        continue
                     try:
                         val = float(offers["price"])
                         if val > 0:
@@ -161,11 +199,13 @@ def extract_first_gbp_price_from_search(html: str, set_number: str | None) -> fl
                     except (KeyError, TypeError, ValueError):
                         pass
 
-    # Fallback: look for £XX.XX near the set number in text
     text = soup.get_text(" ", strip=True)
     if set_number and set_number in text:
         idx = text.find(set_number)
         snippet = text[max(0, idx - 100) : idx + 300]
+        lower_snip = snippet.lower()
+        if any(phrase in lower_snip for phrase in OUT_OF_STOCK_PHRASES):
+            return None
         match = re.search(r"£\s*(\d{1,4}(?:\.\d{2})?)", snippet)
         if match:
             return round(float(match.group(1)), 2)
@@ -183,31 +223,34 @@ async def find_best_uk_offer(
     prefer_click_and_collect: bool = False,
     keepa_api_key: str | None = None,
 ) -> tuple[UKOffer | None, list[str]]:
-    """Check direct URL or multiple UK retailers and return the cheapest landed offer."""
+    """Check direct URL or multiple UK retailers and return the cheapest in-stock landed offer."""
     offers: list[UKOffer] = []
     notes: list[str] = []
 
     if direct_url:
         res = await fetch_price_for_url(session, direct_url, keepa_api_key=keepa_api_key)
         if res.ok and res.quote is not None:
-            ship = estimate_uk_shipping(
-                res.quote.price_gbp,
-                res.quote.retailer,
-                has_amazon_prime=has_amazon_prime,
-                prefer_click_and_collect=prefer_click_and_collect,
-            )
-            offers.append(
-                UKOffer(
-                    retailer=res.quote.retailer,
-                    url=direct_url,
-                    item_price_gbp=res.quote.price_gbp,
-                    shipping_gbp=ship.shipping_gbp,
-                    total_gbp=ship.total_gbp,
-                    shipping_note=ship.note,
-                    historical_low_gbp=res.quote.historical_low_gbp,
-                    historical_avg_gbp=res.quote.historical_avg_gbp,
+            if not res.quote.in_stock:
+                notes.append(f"Direct URL ({res.quote.retailer.display_name}): out of stock (skipped)")
+            else:
+                ship = estimate_uk_shipping(
+                    res.quote.price_gbp,
+                    res.quote.retailer,
+                    has_amazon_prime=has_amazon_prime,
+                    prefer_click_and_collect=prefer_click_and_collect,
                 )
-            )
+                offers.append(
+                    UKOffer(
+                        retailer=res.quote.retailer,
+                        url=direct_url,
+                        item_price_gbp=res.quote.price_gbp,
+                        shipping_gbp=ship.shipping_gbp,
+                        total_gbp=ship.total_gbp,
+                        shipping_note=ship.note,
+                        historical_low_gbp=res.quote.historical_low_gbp,
+                        historical_avg_gbp=res.quote.historical_avg_gbp,
+                    )
+                )
         else:
             notes.append(f"Direct URL: {res.error}")
 
@@ -215,22 +258,25 @@ async def find_best_uk_offer(
         if retailer == UKRetailer.LEGO_UK:
             res = await fetch_price_for_url(session, url, keepa_api_key=keepa_api_key)
             if res.ok and res.quote is not None:
-                ship = estimate_uk_shipping(
-                    res.quote.price_gbp,
-                    retailer,
-                    has_amazon_prime=has_amazon_prime,
-                    prefer_click_and_collect=prefer_click_and_collect,
-                )
-                offers.append(
-                    UKOffer(
-                        retailer=retailer,
-                        url=url,
-                        item_price_gbp=res.quote.price_gbp,
-                        shipping_gbp=ship.shipping_gbp,
-                        total_gbp=ship.total_gbp,
-                        shipping_note=ship.note,
+                if not res.quote.in_stock:
+                    notes.append("LEGO.com UK: out of stock (skipped)")
+                else:
+                    ship = estimate_uk_shipping(
+                        res.quote.price_gbp,
+                        retailer,
+                        has_amazon_prime=has_amazon_prime,
+                        prefer_click_and_collect=prefer_click_and_collect,
                     )
-                )
+                    offers.append(
+                        UKOffer(
+                            retailer=retailer,
+                            url=url,
+                            item_price_gbp=res.quote.price_gbp,
+                            shipping_gbp=ship.shipping_gbp,
+                            total_gbp=ship.total_gbp,
+                            shipping_note=ship.note,
+                        )
+                    )
             else:
                 notes.append(f"{retailer.display_name}: {res.error}")
             continue
@@ -249,7 +295,7 @@ async def find_best_uk_offer(
 
         price = extract_first_gbp_price_from_search(html, set_number)
         if price is None:
-            notes.append(f"{retailer.display_name}: no matching GBP price found")
+            notes.append(f"{retailer.display_name}: no in-stock GBP price found")
             continue
 
         ship = estimate_uk_shipping(
