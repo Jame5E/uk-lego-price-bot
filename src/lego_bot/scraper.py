@@ -182,6 +182,69 @@ async def fetch_amazon_uk_keepa(
     )
 
 
+async def search_amazon_uk_keepa(
+    session: aiohttp.ClientSession,
+    set_number: str,
+    api_key: str,
+) -> tuple[FetchResult, str | None]:
+    """Search Keepa Amazon UK (domain=2) by LEGO set number."""
+    clean_num = set_number.strip().split("-")[0]
+    endpoint = "https://api.keepa.com/search"
+    params = {
+        "key": api_key,
+        "domain": "2",
+        "type": "product",
+        "term": f"LEGO {clean_num}",
+        "stats": "90",
+    }
+    try:
+        async with session.get(endpoint, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                return FetchResult(ok=False, error=f"Keepa Search HTTP {resp.status}"), None
+            payload = await resp.json()
+    except Exception as exc:
+        return FetchResult(ok=False, error=f"Keepa Search {type(exc).__name__}"), None
+
+    products = payload.get("products") or []
+    for prod in products:
+        title = str(prod.get("title") or "")
+        if clean_num not in title:
+            continue
+        stats = prod.get("stats") or {}
+        current = stats.get("current") or []
+        pence = current[0] if len(current) > 0 and current[0] > 0 else (
+            current[1] if len(current) > 1 and current[1] > 0 else -1
+        )
+        if pence <= 0:
+            continue
+        asin = prod.get("asin")
+        amazon_url = f"https://www.amazon.co.uk/dp/{asin}" if asin else None
+        avg90 = stats.get("avg90") or []
+        min_stats = stats.get("min") or []
+        avg_gbp = round(avg90[0] / 100, 2) if len(avg90) > 0 and avg90[0] > 0 else None
+        low_gbp = (
+            round(min_stats[0][1] / 100, 2)
+            if len(min_stats) > 0 and isinstance(min_stats[0], list) and len(min_stats[0]) > 1 and min_stats[0][1] > 0
+            else None
+        )
+        return (
+            FetchResult(
+                ok=True,
+                quote=PriceQuote(
+                    price_gbp=round(pence / 100, 2),
+                    retailer=UKRetailer.AMAZON_UK,
+                    in_stock=True,
+                    source="keepa",
+                    historical_low_gbp=low_gbp,
+                    historical_avg_gbp=avg_gbp,
+                ),
+            ),
+            amazon_url,
+        )
+
+    return FetchResult(ok=False, error="Keepa UK: no active Amazon UK price found"), None
+
+
 async def fetch_price_for_url(
     session: aiohttp.ClientSession,
     url: str,
