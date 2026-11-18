@@ -713,6 +713,47 @@ class LegoTrackerBot(discord.Client):
             )
             await interaction.response.send_message(embed=embed)
 
+        @item_group.command(name="notify_list", description="See who gets pinged when a LEGO set goes on sale")
+        @app_commands.describe(set_number="Optional LEGO set number (e.g. 10316). Leave blank to see all sets.")
+        async def item_notify_list(interaction: discord.Interaction, set_number: Optional[str] = None) -> None:
+            if set_number:
+                item = self.db.get_item_by_set_number(set_number)
+                if not item:
+                    await interaction.response.send_message(
+                        embed=make_error_embed("Not Found", f"Set #{set_number} is not on your wishlist."),
+                        ephemeral=True,
+                    )
+                    return
+                items = [item]
+            else:
+                items = self.db.list_items()
+                if not items:
+                    await interaction.response.send_message(
+                        embed=make_status_embed("🔔 Notification List", "Your wishlist is currently empty.")
+                    )
+                    return
+
+            embeds: list[discord.Embed] = []
+            for item in items[:10]:
+                pings = format_pings(
+                    self.config.user_id,
+                    item,
+                    extra_user_ids=self.config.extra_notify_user_ids,
+                )
+                cat_line = f"📂 **Category:** {item.category}\n" if item.category else ""
+                box_art = item.image_url or default_box_art_url(item.set_number)
+                embeds.append(
+                    make_status_embed(
+                        f"🔔 Notifications: {format_item_title(item)}",
+                        f"{cat_line}• **Pinged on sale:** {pings}",
+                        color=discord.Color.blue(),
+                        image_url=box_art,
+                        footer=f"Set #{item.set_number or item.id} • Use /item notify or /item notify_remove to edit",
+                    )
+                )
+
+            await interaction.response.send_message(embeds=embeds)
+
         @item_group.command(name="check", description="Check UK prices right now for one set or all sets")
         @app_commands.describe(set_number="Optional specific LEGO set number to check")
         async def item_check(interaction: discord.Interaction, set_number: Optional[str] = None) -> None:
