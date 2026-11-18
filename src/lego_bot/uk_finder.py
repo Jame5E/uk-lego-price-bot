@@ -11,7 +11,7 @@ from urllib.parse import quote_plus
 import aiohttp
 from bs4 import BeautifulSoup
 
-from .scraper import DEFAULT_HEADERS, fetch_price_for_url, parse_price_from_html
+from .scraper import DEFAULT_HEADERS, fetch_price_for_url, parse_price_from_html, search_amazon_uk_keepa
 from .shipping import UKRetailer, estimate_uk_shipping
 
 OUT_OF_STOCK_PHRASES = (
@@ -494,15 +494,23 @@ async def _fetch_brickset_uk_offers(
     prefer_click_and_collect: bool = False,
 ) -> tuple[list[UKOffer], str | None]:
     """Extract UK retailer prices (e.g. Amazon UK, LEGO.com, Zavvi) from Brickset set page."""
+    if _is_source_cooled_down("brickset_uk"):
+        return [], "Brickset UK: temporarily skipped (rate-limit cooldown)"
+
     clean_num = set_number.strip().split("-")[0]
     url = f"https://brickset.com/sets/{clean_num}-1"
     try:
         async with session.get(url, headers=DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=8)) as resp:
             if resp.status != 200:
+                if resp.status in (403, 429, 503):
+                    _record_source_block("brickset_uk")
                 return [], f"Brickset UK: HTTP {resp.status}"
             html = await resp.text()
     except Exception as exc:
+        _record_source_block("brickset_uk")
         return [], f"Brickset UK: {type(exc).__name__}"
+
+    _record_source_ok("brickset_uk")
 
     if "£" not in html:
         return [], "Brickset UK: no live retailer prices listed"
@@ -690,6 +698,32 @@ async def find_best_uk_offer(
     notes: list[str] = []
 
     tasks = []
+    if set_number and keepa_api_key:
+        async def _check_keepa_search() -> tuple[list[UKOffer], str | None]:
+            res, amazon_url = await search_amazon_uk_keepa(session, set_number, keepa_api_key)
+            if res.ok and res.quote is not None:
+                ship = estimate_uk_shipping(
+                    res.quote.price_gbp,
+                    res.quote.retailer,
+                    has_amazon_prime=has_amazon_prime,
+                    prefer_click_and_collect=prefer_click_and_collect,
+                )
+                return [
+                    UKOffer(
+                        retailer=res.quote.retailer,
+                        url=amazon_url or f"https://www.amazon.co.uk/s?k=LEGO+{set_number}",
+                        item_price_gbp=res.quote.price_gbp,
+                        shipping_gbp=ship.shipping_gbp,
+                        total_gbp=ship.total_gbp,
+                        shipping_note=ship.note,
+                        historical_low_gbp=res.quote.historical_low_gbp,
+                        historical_avg_gbp=res.quote.historical_avg_gbp,
+                    )
+                ], None
+            return [], res.error
+
+        tasks.append(_check_keepa_search())
+
     if set_number:
         tasks.append(
             _fetch_brickset_uk_offers(
