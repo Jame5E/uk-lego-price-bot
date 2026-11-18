@@ -394,6 +394,7 @@ async def _fetch_brickwatch_uk(
     *,
     has_amazon_prime: bool = False,
     prefer_click_and_collect: bool = False,
+    proxy_url: str | None = None,
 ) -> tuple[list[UKOffer], str | None]:
     """Query BrickWatch UK aggregator for current in-stock UK retailer prices."""
     if _is_source_cooled_down("brickwatch_uk"):
@@ -402,7 +403,7 @@ async def _fetch_brickwatch_uk(
     clean_num = set_number.strip().split("-")[0]
     url = f"https://www.brickwatch.net/en-GB/set/{clean_num}/"
     try:
-        async with session.get(url, headers=DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+        async with session.get(url, headers=DEFAULT_HEADERS, proxy=proxy_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
             if resp.status != 200:
                 if resp.status in (202, 403, 429, 503):
                     _record_source_block("brickwatch_uk")
@@ -573,6 +574,8 @@ async def _fetch_brickset_uk_offers(
 async def _fetch_pricerunner_uk(
     session: aiohttp.ClientSession,
     set_number: str,
+    *,
+    proxy_url: str | None = None,
 ) -> tuple[list[UKOffer], str | None]:
     """Query PriceRunner UK search for GBP LEGO prices."""
     if _is_source_cooled_down("pricerunner_uk"):
@@ -581,7 +584,7 @@ async def _fetch_pricerunner_uk(
     clean_num = set_number.strip().split("-")[0]
     url = f"https://www.pricerunner.com/results?q=lego+{clean_num}"
     try:
-        async with session.get(url, headers=DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+        async with session.get(url, headers=DEFAULT_HEADERS, proxy=proxy_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
             if resp.status != 200:
                 if resp.status in (202, 403, 429, 503):
                     _record_source_block("pricerunner_uk")
@@ -617,13 +620,14 @@ async def _check_retailer_url(
     has_amazon_prime: bool,
     prefer_click_and_collect: bool,
     keepa_api_key: str | None,
+    proxy_url: str | None = None,
 ) -> tuple[list[UKOffer], str | None]:
     source_key = f"retailer_{retailer.value}"
     if _is_source_cooled_down(source_key):
         return [], f"{retailer.display_name}: temporarily skipped (cooldown)"
 
     if retailer == UKRetailer.LEGO_UK:
-        res = await fetch_price_for_url(session, url, keepa_api_key=keepa_api_key)
+        res = await fetch_price_for_url(session, url, keepa_api_key=keepa_api_key, proxy_url=proxy_url)
         if res.ok and res.quote is not None:
             _record_source_ok(source_key)
             if not res.quote.in_stock:
@@ -650,7 +654,7 @@ async def _check_retailer_url(
 
     try:
         async with session.get(
-            url, headers=DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=8)
+            url, headers=DEFAULT_HEADERS, proxy=proxy_url, timeout=aiohttp.ClientTimeout(total=8)
         ) as resp:
             if resp.status != 200:
                 if resp.status in (202, 403, 429, 503):
@@ -768,6 +772,7 @@ async def _fetch_hotukdeals_uk(
     *,
     has_amazon_prime: bool = False,
     prefer_click_and_collect: bool = False,
+    proxy_url: str | None = None,
 ) -> tuple[list[UKOffer], str | None]:
     """Check HotUKDeals UK LEGO RSS feed (cached 10 minutes to avoid extra requests)."""
     global _HUKD_CACHE_XML, _HUKD_CACHE_AT
@@ -781,7 +786,7 @@ async def _fetch_hotukdeals_uk(
     if xml_text is None:
         url = "https://www.hotukdeals.com/rss/tag/lego"
         try:
-            async with session.get(url, headers=DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            async with session.get(url, headers=DEFAULT_HEADERS, proxy=proxy_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
                 if resp.status != 200:
                     if resp.status in (202, 403, 429, 503):
                         _record_source_block("hotukdeals_uk")
@@ -812,6 +817,7 @@ async def find_best_uk_offer(
     has_amazon_prime: bool = False,
     prefer_click_and_collect: bool = False,
     keepa_api_key: str | None = None,
+    proxy_url: str | None = None,
 ) -> tuple[UKOffer | None, list[str]]:
     """Check direct URL or multiple UK retailers concurrently and return the cheapest in-stock landed offer."""
     offers: list[UKOffer] = []
@@ -851,6 +857,7 @@ async def find_best_uk_offer(
                 set_number,
                 has_amazon_prime=has_amazon_prime,
                 prefer_click_and_collect=prefer_click_and_collect,
+                proxy_url=proxy_url,
             )
         )
         tasks.append(
@@ -867,9 +874,10 @@ async def find_best_uk_offer(
                 set_number,
                 has_amazon_prime=has_amazon_prime,
                 prefer_click_and_collect=prefer_click_and_collect,
+                proxy_url=proxy_url,
             )
         )
-        tasks.append(_fetch_pricerunner_uk(session, set_number))
+        tasks.append(_fetch_pricerunner_uk(session, set_number, proxy_url=proxy_url))
 
     for retailer, url in build_uk_search_urls(name, set_number):
         tasks.append(
@@ -881,12 +889,13 @@ async def find_best_uk_offer(
                 has_amazon_prime=has_amazon_prime,
                 prefer_click_and_collect=prefer_click_and_collect,
                 keepa_api_key=keepa_api_key,
+                proxy_url=proxy_url,
             )
         )
 
     if direct_url:
         async def _check_direct() -> tuple[list[UKOffer], str | None]:
-            res = await fetch_price_for_url(session, direct_url, keepa_api_key=keepa_api_key)
+            res = await fetch_price_for_url(session, direct_url, keepa_api_key=keepa_api_key, proxy_url=proxy_url)
             if res.ok and res.quote is not None:
                 if not res.quote.in_stock:
                     return [], f"Direct URL ({res.quote.retailer.display_name}): out of stock"
