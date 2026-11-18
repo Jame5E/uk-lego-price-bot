@@ -147,6 +147,7 @@ async def _lookup_brickset_public(
 
     theme: str | None = None
     subtheme: str | None = None
+    availability_val: str = ""
     for dt in soup.find_all("dt"):
         label = dt.get_text(" ", strip=True).lower()
         dd = dt.find_next_sibling("dd")
@@ -157,6 +158,8 @@ async def _lookup_brickset_public(
             theme = val
         elif label == "subtheme":
             subtheme = val
+        elif label in ("availability", "notes", "exit date"):
+            availability_val += " " + val.lower()
 
     name = _enrich_name_with_subtheme(name, subtheme)
     category = _format_category(theme)
@@ -169,7 +172,7 @@ async def _lookup_brickset_public(
     if m:
         rrp_gbp = round(float(m.group(1)), 2)
 
-    retiring = "retiring soon" in text.lower() or "retired" in text.lower()
+    retiring = "retiring soon" in text.lower() or "retiring soon" in availability_val
     return SetMetadata(
         name=name,
         rrp_gbp=rrp_gbp,
