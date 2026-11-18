@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
+import os
 from typing import Optional
 
 import aiohttp
@@ -42,20 +44,29 @@ def build_alert_embed(
 ) -> discord.Embed:
     if "BUY NOW" in analysis.verdict:
         color = discord.Color.green()
+        verdict_icon = "🟢"
     elif "GOOD DEAL" in analysis.verdict or "BUY SOON" in analysis.verdict:
         color = discord.Color.gold()
+        verdict_icon = "🟡"
     else:
         color = discord.Color.orange()
+        verdict_icon = "🟠"
 
-    title_prefix = "[TEST] " if simulated else ""
+    title_prefix = "🧪 [TEST] " if simulated else ""
     atl_badge = "🔥 NEW ALL-TIME LOW! " if is_all_time_low else ""
     set_tag = f" (#{item.set_number})" if item.set_number else ""
     link_url = offer_url or item.url
 
+    headline = (
+        f"🏷️ **£{analysis.total_gbp:.2f}** ~~£{analysis.rrp_gbp:.2f}~~ "
+        f"— **{analysis.discount_pct:.1f}% OFF** *(Save **£{analysis.savings_gbp:.2f}**)*\n"
+        f"📍 Best in-stock UK price at **{retailer.display_name}**"
+    )
+
     embed = discord.Embed(
-        title=f"{title_prefix}{atl_badge}LEGO Deal Alert: {item.name}{set_tag}",
+        title=f"{title_prefix}{atl_badge}{item.name}{set_tag}",
         url=link_url or discord.Embed.Empty,
-        description=f"Best in-stock UK price spotted at **{retailer.display_name}**!",
+        description=headline,
         color=color,
     )
 
@@ -64,49 +75,46 @@ def build_alert_embed(
         embed.set_thumbnail(url=thumb)
 
     embed.add_field(
-        name="Price Breakdown (GBP)",
+        name="💷 Price Breakdown",
         value=(
-            f"**Item:** £{analysis.item_price_gbp:.2f}\n"
-            f"**UK Shipping:** £{analysis.shipping_gbp:.2f} *({shipping_note})*\n"
-            f"**Total Cost:** **£{analysis.total_gbp:.2f}** (RRP £{analysis.rrp_gbp:.2f})"
-        ),
-        inline=True,
-    )
-
-    embed.add_field(
-        name="Reduction",
-        value=(
-            f"**Saved:** £{analysis.savings_gbp:.2f}\n"
-            f"**Total Discount:** {analysis.discount_pct:.1f}% off\n"
-            f"**Item-only Discount:** {analysis.item_discount_pct:.1f}% off"
+            f"• **Item:** £{analysis.item_price_gbp:.2f}\n"
+            f"• **UK Delivery:** £{analysis.shipping_gbp:.2f} *({shipping_note})*\n"
+            f"• **Total Landed:** **£{analysis.total_gbp:.2f}**"
         ),
         inline=True,
     )
 
     history_lines = []
     if is_all_time_low:
-        history_lines.append("🔥 **NEW ALL-TIME LOW** in your tracked history!")
+        history_lines.append("🔥 **Lowest price ever tracked!**")
     if analysis.historical_low_gbp is not None:
-        history_lines.append(f"**Tracked Low:** £{analysis.historical_low_gbp:.2f}")
+        history_lines.append(f"• **Tracked Low:** £{analysis.historical_low_gbp:.2f}")
     if analysis.historical_avg_gbp is not None:
-        history_lines.append(f"**Tracked Avg:** £{analysis.historical_avg_gbp:.2f}")
-    if item.is_retiring:
-        history_lines.append("**Status:** Retiring Soon")
-    if history_lines:
-        embed.add_field(name="Price Context", value="\n".join(history_lines), inline=False)
+        history_lines.append(f"• **Tracked Avg:** £{analysis.historical_avg_gbp:.2f}")
+    history_lines.append(f"• **Retiring Soon:** {'⚠️ Yes' if item.is_retiring else 'No'}")
 
     embed.add_field(
-        name=f"Verdict: {analysis.verdict}",
+        name="📊 Price Context",
+        value="\n".join(history_lines),
+        inline=True,
+    )
+
+    embed.add_field(
+        name=f"{verdict_icon} Verdict: {analysis.verdict}",
         value=analysis.forecast,
         inline=False,
     )
 
     if link_url:
-        embed.add_field(name="Link", value=f"[View on {retailer.display_name}]({link_url})", inline=False)
+        embed.add_field(
+            name="🛒 Where to Buy",
+            value=f"**[Open {retailer.display_name} Deal Page →]({link_url})**",
+            inline=False,
+        )
     if has_chart:
         embed.set_image(url="attachment://chart.png")
 
-    embed.set_footer(text=f"Wishlist ID #{item.id} • Prices in GBP (£) including UK shipping")
+    embed.set_footer(text=f"Set #{item.set_number or item.id} • UK GBP (£) inc. delivery")
     return embed
 
 
@@ -134,10 +142,13 @@ class LegoTrackerBot(discord.Client):
 
         self.price_check_loop.change_interval(minutes=self.config.check_interval_minutes)
         self.price_check_loop.start()
+        self.auto_update_loop.start()
 
     async def close(self) -> None:
         if self.price_check_loop.is_running():
             self.price_check_loop.cancel()
+        if self.auto_update_loop.is_running():
+            self.auto_update_loop.cancel()
         if self.http_session and not self.http_session.closed:
             await self.http_session.close()
         self.db.close()
@@ -145,6 +156,43 @@ class LegoTrackerBot(discord.Client):
 
     async def on_ready(self) -> None:
         logger.info("Logged in as %s (ID: %s)", self.user, self.user.id if self.user else "?")
+
+    @tasks.loop(minutes=15)
+    async def auto_update_loop(self) -> None:
+        """Check origin/main every 15 minutes; if updated, pull and exit so systemd restarts."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "fetch", "origin", "main",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
+            if proc.returncode != 0:
+                return
+
+            count_proc = await asyncio.create_subprocess_exec(
+                "git", "rev-list", "--count", "HEAD..origin/main",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out, _ = await count_proc.communicate()
+            if count_proc.returncode == 0 and out.decode().strip().isdigit() and int(out.decode().strip()) > 0:
+                logger.info("New commit detected on origin/main. Pulling and restarting...")
+                pull_proc = await asyncio.create_subprocess_exec(
+                    "git", "pull", "--ff-only", "origin", "main",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await pull_proc.communicate()
+                if pull_proc.returncode == 0:
+                    await self.close()
+                    os._exit(0)
+        except Exception as exc:
+            logger.debug("Auto-update check skipped: %s", exc)
+
+    @auto_update_loop.before_loop
+    async def before_auto_update_loop(self) -> None:
+        await self.wait_until_ready()
 
     @tasks.loop(minutes=30)
     async def price_check_loop(self) -> None:
