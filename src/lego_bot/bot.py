@@ -5,7 +5,7 @@ import io
 import logging
 import os
 import time
-from typing import Literal, Optional
+from typing import Awaitable, Callable, Literal, Optional
 
 import aiohttp
 import discord
@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("lego_bot")
 
-COMMAND_TIMEOUT_SECONDS = 180.0
+COMMAND_TIMEOUT_SECONDS = 300.0
 
 
 def format_pings(
@@ -430,7 +430,12 @@ class LegoTrackerBot(discord.Client):
     async def before_price_check_loop(self) -> None:
         await self.wait_until_ready()
 
-    async def run_price_checks(self, set_number: str | None = None) -> list[discord.Embed]:
+    async def run_price_checks(
+        self,
+        set_number: str | None = None,
+        *,
+        on_item_embed: Callable[[discord.Embed], Awaitable[None]] | None = None,
+    ) -> list[discord.Embed]:
         assert self.http_session is not None
         if set_number:
             found = self.db.get_item_by_set_number(set_number)
@@ -439,7 +444,10 @@ class LegoTrackerBot(discord.Client):
             items = self.db.list_items()
 
         if not items:
-            return [make_status_embed("🧩 Your LEGO Wishlist", "No tracked LEGO items found.")]
+            empty_embed = make_status_embed("🧩 Your LEGO Wishlist", "No tracked LEGO items found.")
+            if on_item_embed is not None:
+                await on_item_embed(empty_embed)
+            return [empty_embed]
 
         channel = self.get_channel(self.config.channel_id)
         if channel is None:
@@ -447,81 +455,73 @@ class LegoTrackerBot(discord.Client):
                 channel = await self.fetch_channel(self.config.channel_id)
             except Exception as exc:
                 logger.error("Could not fetch alert channel %s: %s", self.config.channel_id, exc)
-                return [make_error_embed("Channel Error", f"Could not access alert channel {self.config.channel_id}.")]
+                err_embed = make_error_embed("Channel Error", f"Could not access alert channel {self.config.channel_id}.")
+                if on_item_embed is not None:
+                    await on_item_embed(err_embed)
+                return [err_embed]
 
-        sem = asyncio.Semaphore(4)
         now_mono = time.monotonic()
-
-        async def _fetch_for_item(item: TrackedItem):
-            async with sem:
-                rrp = item.rrp_gbp
-                is_retiring = item.is_retiring
-                image_url = item.image_url
-                resolved_name = item.name
-                category = item.category
-
-                retiring_due = is_retiring and (
-                    now_mono - self._last_retiring_meta_check.get(item.id, 0.0) >= 86400.0
-                )
-                needs_meta = (
-                    rrp <= 0
-                    or not image_url
-                    or not category
-                    or resolved_name.startswith("LEGO Set #")
-                    or ":" not in resolved_name
-                    or retiring_due
-                )
-                meta = None
-                if needs_meta and item.set_number:
-                    meta = await lookup_set_metadata(
-                        self.http_session, item.set_number, brickset_api_key=self.config.brickset_api_key
-                    )
-                    self._last_retiring_meta_check[item.id] = now_mono
-                    if meta.is_retired:
-                        return item, meta, resolved_name, category, rrp, is_retiring, image_url, None, []
-                    if meta.name and (resolved_name.startswith("LEGO Set #") or len(meta.name) > len(resolved_name)):
-                        resolved_name = meta.name
-                    if not category and meta.category:
-                        category = meta.category
-                    if rrp <= 0 and meta.rrp_gbp:
-                        rrp = meta.rrp_gbp
-                    if meta.source in ("brickset", "brickset_web", "lego_uk"):
-                        is_retiring = meta.is_retiring
-                    if not image_url and meta.image_url:
-                        image_url = meta.image_url
-
-                best_offer, notes = await find_best_uk_offer(
-                    self.http_session,
-                    name=resolved_name,
-                    set_number=item.set_number,
-                    direct_url=item.url,
-                    has_amazon_prime=self.config.has_amazon_prime,
-                    prefer_click_and_collect=self.config.prefer_click_and_collect,
-                    keepa_api_key=self.config.keepa_api_key,
-                )
-                return item, meta, resolved_name, category, rrp, is_retiring, image_url, best_offer, notes
-
-        fetched = await asyncio.gather(*(_fetch_for_item(it) for it in items))
-
         result_embeds: list[discord.Embed] = []
-        for item, meta, resolved_name, category, rrp, is_retiring, image_url, best_offer, notes in fetched:
-            if meta is not None and meta.is_retired:
-                title = format_item_title(item)
-                box_art = item.image_url or default_box_art_url(item.set_number)
-                self.db.remove_item(item.id)
-                if item.set_number:
-                    remove_wishlist_entry(self.config.wishlist_path, item.set_number)
-                result_embeds.append(
-                    make_status_embed(
-                        f"📦 Removed Retired Set: {title}",
-                        "This LEGO set has now **retired** and was automatically removed from your wishlist.",
-                        color=discord.Color.dark_grey(),
-                        image_url=box_art,
-                    )
-                )
-                continue
 
-            if meta is not None:
+        async def _emit(embed: discord.Embed) -> None:
+            result_embeds.append(embed)
+            if on_item_embed is not None:
+                await on_item_embed(embed)
+
+        for idx, item in enumerate(items):
+            if idx > 0:
+                await asyncio.sleep(1.2)
+
+            rrp = item.rrp_gbp
+            is_retiring = item.is_retiring
+            image_url = item.image_url
+            resolved_name = item.name
+            category = item.category
+
+            retiring_due = is_retiring and (
+                now_mono - self._last_retiring_meta_check.get(item.id, 0.0) >= 86400.0
+            )
+            needs_meta = (
+                rrp <= 0
+                or not image_url
+                or not category
+                or resolved_name.startswith("LEGO Set #")
+                or ":" not in resolved_name
+                or retiring_due
+            )
+            meta = None
+            if needs_meta and item.set_number:
+                meta = await lookup_set_metadata(
+                    self.http_session, item.set_number, brickset_api_key=self.config.brickset_api_key
+                )
+                self._last_retiring_meta_check[item.id] = now_mono
+                if meta.is_retired:
+                    title = format_item_title(item)
+                    box_art = item.image_url or default_box_art_url(item.set_number)
+                    self.db.remove_item(item.id)
+                    if item.set_number:
+                        remove_wishlist_entry(self.config.wishlist_path, item.set_number)
+                    await _emit(
+                        make_status_embed(
+                            f"📦 Removed Retired Set: {title}",
+                            "This LEGO set has now **retired** and was automatically removed from your wishlist.",
+                            color=discord.Color.dark_grey(),
+                            image_url=box_art,
+                        )
+                    )
+                    continue
+
+                if meta.name and (resolved_name.startswith("LEGO Set #") or len(meta.name) > len(resolved_name)):
+                    resolved_name = meta.name
+                if not category and meta.category:
+                    category = meta.category
+                if rrp <= 0 and meta.rrp_gbp:
+                    rrp = meta.rrp_gbp
+                if meta.source in ("brickset", "brickset_web", "lego_uk"):
+                    is_retiring = meta.is_retiring
+                if not image_url and meta.image_url:
+                    image_url = meta.image_url
+
                 self.db.update_item(
                     item.id,
                     name=resolved_name,
@@ -544,6 +544,16 @@ class LegoTrackerBot(discord.Client):
                         },
                     )
 
+            best_offer, notes = await find_best_uk_offer(
+                self.http_session,
+                name=resolved_name,
+                set_number=item.set_number,
+                direct_url=item.url,
+                has_amazon_prime=self.config.has_amazon_prime,
+                prefer_click_and_collect=self.config.prefer_click_and_collect,
+                keepa_api_key=self.config.keepa_api_key,
+            )
+
             title = format_item_title(item)
             box_art = item.image_url or default_box_art_url(item.set_number)
             cat_line = f"📂 **Category:** {item.category}\n" if item.category else ""
@@ -551,7 +561,7 @@ class LegoTrackerBot(discord.Client):
             if best_offer is None:
                 rrp_line = f"💷 **Normal RRP:** £{rrp:.2f}\n" if rrp > 0 else ""
                 diag = "\n".join(f"• {n}" for n in notes[:5]) if notes else "No retailers responded."
-                result_embeds.append(
+                await _emit(
                     make_status_embed(
                         f"🧩 {title}",
                         (
@@ -597,7 +607,7 @@ class LegoTrackerBot(discord.Client):
 
             icon = "🟢" if "BUY NOW" in analysis.verdict else ("🟡" if "GOOD" in analysis.verdict or "SOON" in analysis.verdict else "🟠")
             color = discord.Color.green() if "BUY NOW" in analysis.verdict else (discord.Color.gold() if "GOOD" in analysis.verdict or "SOON" in analysis.verdict else discord.Color.blue())
-            result_embeds.append(
+            await _emit(
                 make_status_embed(
                     f"🧩 {title}",
                     (
@@ -808,15 +818,16 @@ class LegoTrackerBot(discord.Client):
         async def wishlist_check(interaction: discord.Interaction) -> None:
             await interaction.response.defer()
             try:
-                embeds = await asyncio.wait_for(
-                    self.run_price_checks(set_number=None),
+                async def _send_one(embed: discord.Embed) -> None:
+                    await interaction.followup.send(embed=embed)
+
+                await asyncio.wait_for(
+                    self.run_price_checks(set_number=None, on_item_embed=_send_one),
                     timeout=COMMAND_TIMEOUT_SECONDS,
                 )
-                for i in range(0, len(embeds), 5):
-                    await interaction.followup.send(embeds=embeds[i : i + 5])
             except asyncio.TimeoutError:
                 await interaction.followup.send(
-                    embed=make_error_embed("Price Check Timed Out", "UK retailers took too long to respond (>45s). Please try again.")
+                    embed=make_error_embed("Price Check Timed Out", "UK retailers took too long to respond (>5m). Please try again.")
                 )
             except Exception as exc:
                 logger.exception("wishlist check failed")
@@ -1081,15 +1092,16 @@ class LegoTrackerBot(discord.Client):
         async def item_check(interaction: discord.Interaction, set_number: Optional[str] = None) -> None:
             await interaction.response.defer()
             try:
-                embeds = await asyncio.wait_for(
-                    self.run_price_checks(set_number=set_number),
+                async def _send_one(embed: discord.Embed) -> None:
+                    await interaction.followup.send(embed=embed)
+
+                await asyncio.wait_for(
+                    self.run_price_checks(set_number=set_number, on_item_embed=_send_one),
                     timeout=COMMAND_TIMEOUT_SECONDS,
                 )
-                for i in range(0, len(embeds), 5):
-                    await interaction.followup.send(embeds=embeds[i : i + 5])
             except asyncio.TimeoutError:
                 await interaction.followup.send(
-                    embed=make_error_embed("Price Check Timed Out", "The check took longer than 45s. Please try again.")
+                    embed=make_error_embed("Price Check Timed Out", "The check took longer than 5m. Please try again.")
                 )
             except Exception as exc:
                 logger.exception("item check failed")
