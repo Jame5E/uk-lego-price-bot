@@ -4,7 +4,7 @@ import asyncio
 import io
 import logging
 import os
-from typing import Optional
+from typing import Literal, Optional
 
 import aiohttp
 import discord
@@ -764,6 +764,60 @@ class LegoTrackerBot(discord.Client):
             await interaction.response.send_message(embeds=batches[0])
             for batch in batches[1:]:
                 await interaction.followup.send(embeds=batch)
+
+        @item_group.command(name="notify_all", description="Add or remove a user from sale pings on ALL wishlist items at once")
+        @app_commands.describe(user="Discord user to add or remove", action="Whether to add or remove this user (default: add)")
+        async def item_notify_all(
+            interaction: discord.Interaction,
+            user: discord.User,
+            action: Literal["add", "remove"] = "add",
+        ) -> None:
+            items = self.db.list_items()
+            if not items:
+                await interaction.response.send_message(
+                    embed=make_status_embed("🔔 Notification List", "Your wishlist is currently empty.")
+                )
+                return
+
+            uid = str(user.id)
+            updated_count = 0
+            for item in items:
+                current = (
+                    list(item.notify_user_ids)
+                    if item.notify_user_ids
+                    else list(dict.fromkeys([str(self.config.user_id), *self.config.extra_notify_user_ids]))
+                )
+                changed = False
+                if action == "add" and uid not in current:
+                    current.append(uid)
+                    changed = True
+                elif action == "remove" and uid in current:
+                    current.remove(uid)
+                    changed = True
+                elif not item.notify_user_ids:
+                    changed = True
+
+                if changed:
+                    updated = self.db.update_item(item.id, notify_user_ids=current)
+                    if updated and updated.set_number:
+                        upsert_wishlist_entry(
+                            self.config.wishlist_path,
+                            {
+                                "name": updated.name,
+                                "set_number": updated.set_number,
+                                "notify_user_ids": list(updated.notify_user_ids),
+                            },
+                        )
+                    updated_count += 1
+
+            verb = "Added" if action == "add" else "Removed"
+            prep = "to" if action == "add" else "from"
+            embed = make_status_embed(
+                f"🔔 Updated All Wishlist Pings",
+                f"{verb} <@{uid}> {prep} sale alerts across **{len(items)}** wishlist set(s) ({updated_count} updated).",
+                color=discord.Color.green() if action == "add" else discord.Color.orange(),
+            )
+            await interaction.response.send_message(embed=embed)
 
         @item_group.command(name="check", description="Check UK prices right now for one set or all sets")
         @app_commands.describe(set_number="Optional specific LEGO set number to check")
