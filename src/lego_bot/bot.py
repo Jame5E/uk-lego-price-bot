@@ -814,15 +814,16 @@ class LegoTrackerBot(discord.Client):
             for batch in batches[1:]:
                 await interaction.followup.send(embeds=batch)
 
-        @wishlist_group.command(name="check", description="Check the current UK price of all items on your wishlist right now")
-        async def wishlist_check(interaction: discord.Interaction) -> None:
+        @wishlist_group.command(name="check", description="Check the current UK price of all items (or one specific set) on your wishlist")
+        @app_commands.describe(set_number="Optional LEGO set number to check (leave blank to check all)")
+        async def wishlist_check(interaction: discord.Interaction, set_number: Optional[str] = None) -> None:
             await interaction.response.defer()
             try:
                 async def _send_one(embed: discord.Embed) -> None:
                     await interaction.followup.send(embed=embed)
 
                 await asyncio.wait_for(
-                    self.run_price_checks(set_number=None, on_item_embed=_send_one),
+                    self.run_price_checks(set_number=set_number, on_item_embed=_send_one),
                     timeout=COMMAND_TIMEOUT_SECONDS,
                 )
             except asyncio.TimeoutError:
@@ -834,6 +835,24 @@ class LegoTrackerBot(discord.Client):
                 await interaction.followup.send(
                     embed=make_error_embed("Price Check Error", str(exc))
                 )
+
+        @wishlist_check.autocomplete("set_number")
+        async def _wishlist_check_autocomplete(
+            interaction: discord.Interaction,
+            current: str,
+        ) -> list[app_commands.Choice[str]]:
+            query = current.lower().strip()
+            choices: list[app_commands.Choice[str]] = []
+            for item in self.db.list_items():
+                if not item.set_number:
+                    continue
+                label = format_item_title(item)[:100]
+                if query and query not in label.lower() and query not in item.set_number.lower():
+                    continue
+                choices.append(app_commands.Choice(name=label, value=item.set_number))
+                if len(choices) >= 25:
+                    break
+            return choices
 
         @wishlist_group.command(name="edit", description="Edit alert settings for a tracked LEGO set")
         @app_commands.describe(
