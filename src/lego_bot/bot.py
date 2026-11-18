@@ -552,6 +552,7 @@ class LegoTrackerBot(discord.Client):
                 has_amazon_prime=self.config.has_amazon_prime,
                 prefer_click_and_collect=self.config.prefer_click_and_collect,
                 keepa_api_key=self.config.keepa_api_key,
+                proxy_url=self.config.proxy_url,
             )
 
             title = format_item_title(item)
