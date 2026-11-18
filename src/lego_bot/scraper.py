@@ -250,6 +250,7 @@ async def fetch_price_for_url(
     url: str,
     *,
     keepa_api_key: str | None = None,
+    proxy_url: str | None = None,
 ) -> FetchResult:
     """Fetch current GBP price for a UK retailer URL."""
     retailer = detect_retailer_from_url(url)
@@ -265,6 +266,7 @@ async def fetch_price_for_url(
         async with session.get(
             url,
             headers=DEFAULT_HEADERS,
+            proxy=proxy_url,
             timeout=aiohttp.ClientTimeout(total=15),
         ) as resp:
             if resp.status in (403, 429, 503):
