@@ -31,6 +31,12 @@ def format_pings(default_user_id: int, item: TrackedItem) -> str:
     return " ".join(f"<@{uid}>" for uid in dict.fromkeys(ids))
 
 
+def format_item_title(item: TrackedItem) -> str:
+    if item.set_number and item.set_number not in item.name:
+        return f"{item.name} (#{item.set_number})"
+    return item.name
+
+
 def build_alert_embed(
     item: TrackedItem,
     analysis: PriceAnalysis,
@@ -186,11 +192,20 @@ class LegoTrackerBot(discord.Client):
             rrp = item.rrp_gbp
             is_retiring = item.is_retiring
             image_url = item.image_url
+            resolved_name = item.name
 
-            if (rrp <= 0 or not is_retiring or not image_url) and item.set_number:
+            needs_meta = (
+                rrp <= 0
+                or not is_retiring
+                or not image_url
+                or resolved_name.startswith("LEGO Set #")
+            )
+            if needs_meta and item.set_number:
                 meta = await lookup_set_metadata(
                     self.http_session, item.set_number, brickset_api_key=self.config.brickset_api_key
                 )
+                if meta.name and resolved_name.startswith("LEGO Set #"):
+                    resolved_name = meta.name
                 if rrp <= 0 and meta.rrp_gbp:
                     rrp = meta.rrp_gbp
                 if meta.is_retiring:
@@ -199,11 +214,23 @@ class LegoTrackerBot(discord.Client):
                     image_url = meta.image_url
                 self.db.update_item(
                     item.id,
+                    name=resolved_name,
                     rrp_gbp=rrp if rrp > 0 else None,
                     is_retiring=is_retiring,
                     image_url=image_url,
                 )
                 item = self.db.get_item(item.id) or item
+                if item.set_number:
+                    upsert_wishlist_entry(
+                        self.config.wishlist_path,
+                        {
+                            "name": item.name,
+                            "set_number": item.set_number,
+                            "rrp_gbp": item.rrp_gbp if item.rrp_gbp > 0 else None,
+                            "is_retiring": item.is_retiring,
+                            "image_url": item.image_url,
+                        },
+                    )
 
             best_offer, notes = await find_best_uk_offer(
                 self.http_session,
@@ -214,8 +241,13 @@ class LegoTrackerBot(discord.Client):
                 prefer_click_and_collect=self.config.prefer_click_and_collect,
                 keepa_api_key=self.config.keepa_api_key,
             )
+            title = format_item_title(item)
             if best_offer is None:
-                summaries.append(f"#{item.set_number or item.id} {item.name}: no in-stock UK offers ({'; '.join(notes)})")
+                rrp_hint = f"RRP £{rrp:.2f}" if rrp > 0 else "RRP unknown"
+                summaries.append(
+                    f"**🧩 {title}** ({rrp_hint})\n"
+                    f"• ⚠️ No live UK offers found right now *(retailers blocked automated check)*"
+                )
                 continue
 
             if rrp <= 0:
@@ -247,9 +279,11 @@ class LegoTrackerBot(discord.Client):
                 is_retiring=is_retiring,
             )
 
+            icon = "🟢" if "BUY NOW" in analysis.verdict else ("🟡" if "GOOD" in analysis.verdict or "SOON" in analysis.verdict else "🟠")
             summaries.append(
-                f"#{item.set_number or item.id} {item.name}: £{analysis.total_gbp:.2f} at "
-                f"{best_offer.retailer.display_name} ({analysis.discount_pct:.1f}% off) -> {analysis.verdict}"
+                f"**🧩 {title}**\n"
+                f"• 🏷️ **£{analysis.total_gbp:.2f}** *(RRP £{analysis.rrp_gbp:.2f}, {analysis.discount_pct:.1f}% off)* at **{best_offer.retailer.display_name}**\n"
+                f"• {icon} **{analysis.verdict}** — [View Deal]({best_offer.url})"
             )
 
             hit_target = item.target_price_gbp is not None and analysis.total_gbp <= item.target_price_gbp
@@ -537,9 +571,15 @@ class LegoTrackerBot(discord.Client):
             results = await self.run_price_checks(set_number=None)
             embed = discord.Embed(
                 title="🔎 Current UK Wishlist Prices",
-                description="\n".join(results) if results else "No items on your wishlist.",
+                description="\n\n".join(results) if results else "No items on your wishlist.",
                 color=discord.Color.blue(),
             )
+            items = self.db.list_items()
+            if items:
+                thumb = items[0].image_url or default_box_art_url(items[0].set_number)
+                if thumb:
+                    embed.set_thumbnail(url=thumb)
+            embed.set_footer(text="Prices in GBP (£) including estimated UK delivery")
             await interaction.followup.send(embed=embed, ephemeral=True)
 
         bot_group = app_commands.Group(name="bot", description="Bot management commands")
