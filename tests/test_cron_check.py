@@ -26,6 +26,17 @@ def test_sync_wishlist_idempotent():
     db.close()
 
 
+def test_sync_minimal_wishlist_only_name_and_set_number():
+    db = PriceDatabase(":memory:")
+    entries = [{"name": "LEGO Rivendell", "set_number": "10316"}]
+    items = sync_wishlist_to_db(db, entries)
+    assert len(items) == 1
+    assert items[0].set_number == "10316"
+    assert items[0].rrp_gbp == 0.0
+    assert items[0].min_discount_pct == 15.0
+    db.close()
+
+
 def test_build_discord_payload():
     db = PriceDatabase(":memory:")
     item = db.add_item(
