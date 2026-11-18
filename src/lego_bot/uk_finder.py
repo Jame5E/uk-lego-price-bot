@@ -28,6 +28,7 @@ class SetMetadata:
     is_retiring: bool
     image_url: str | None
     source: str
+    category: str | None = None
 
 
 @dataclass(frozen=True)
@@ -57,7 +58,7 @@ async def lookup_set_metadata(
     *,
     brickset_api_key: str | None = None,
 ) -> SetMetadata:
-    """Auto-discover set name, UK RRP (£), box art image, and retiring status."""
+    """Auto-discover set name, category, UK RRP (£), box art image, and retiring status."""
     clean_num = set_number.strip().split("-")[0]
 
     if brickset_api_key:
@@ -65,10 +66,15 @@ async def lookup_set_metadata(
         if meta.rrp_gbp is not None or meta.name is not None:
             return meta
 
+    # Try Brickset public page first (has Theme/Category, Subtheme, RRP £, and Name)
+    public_meta = await _lookup_brickset_public(session, clean_num)
+    if public_meta.name or public_meta.rrp_gbp:
+        return public_meta
+
     lego_url = f"https://www.lego.com/en-gb/product/{clean_num}"
     try:
         async with session.get(
-            lego_url, headers=DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=15)
+            lego_url, headers=DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=12)
         ) as resp:
             if resp.status == 200:
                 html = await resp.text()
@@ -92,11 +98,6 @@ async def lookup_set_metadata(
     except Exception:
         pass
 
-    # Fallback 2: public Brickset set page (great for set name + UK RRP £)
-    public_meta = await _lookup_brickset_public(session, clean_num)
-    if public_meta.name or public_meta.rrp_gbp:
-        return public_meta
-
     return SetMetadata(
         name=None,
         rrp_gbp=None,
@@ -104,6 +105,21 @@ async def lookup_set_metadata(
         image_url=default_box_art_url(clean_num),
         source="fallback",
     )
+
+
+def _format_category(theme: str | None) -> str | None:
+    if not theme:
+        return None
+    t = theme.strip()
+    return t if t.lower().startswith("lego ") else f"LEGO {t}"
+
+
+def _enrich_name_with_subtheme(name: str | None, subtheme: str | None) -> str | None:
+    if not name:
+        return None
+    if subtheme and subtheme.strip() and subtheme.strip().lower() not in name.lower():
+        return f"{subtheme.strip()}: {name}"
+    return name
 
 
 async def _lookup_brickset_public(
@@ -124,11 +140,26 @@ async def _lookup_brickset_public(
     h1 = soup.find("h1")
     if h1:
         raw_title = h1.get_text(" ", strip=True)
-        # Brickset h1 is often "10316-1: The Lord of the Rings: Rivendell"
         if ":" in raw_title and raw_title.split(":", 1)[0].strip().startswith(set_number):
             name = raw_title.split(":", 1)[1].strip()
         else:
             name = raw_title
+
+    theme: str | None = None
+    subtheme: str | None = None
+    for dt in soup.find_all("dt"):
+        label = dt.get_text(" ", strip=True).lower()
+        dd = dt.find_next_sibling("dd")
+        if not dd:
+            continue
+        val = dd.get_text(" ", strip=True)
+        if label == "theme":
+            theme = val
+        elif label == "subtheme":
+            subtheme = val
+
+    name = _enrich_name_with_subtheme(name, subtheme)
+    category = _format_category(theme)
 
     text = soup.get_text(" ", strip=True)
     rrp_gbp: float | None = None
@@ -145,6 +176,7 @@ async def _lookup_brickset_public(
         is_retiring=retiring,
         image_url=default_box_art_url(set_number),
         source="brickset_web",
+        category=category,
     )
 
 
@@ -160,7 +192,7 @@ async def _lookup_brickset(
         "params": json.dumps({"setNumber": f"{set_number}-1"}),
     }
     try:
-        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=12)) as resp:
             if resp.status != 200:
                 return SetMetadata(None, None, False, default_box_art_url(set_number), "brickset_error")
             data = await resp.json()
@@ -176,6 +208,8 @@ async def _lookup_brickset(
     rrp = uk_data.get("retailPrice")
     exit_date_str = uk_data.get("dateLastAvailable") or s.get("exitDate")
     image_url = s.get("image", {}).get("imageURL") or default_box_art_url(set_number)
+    enriched_name = _enrich_name_with_subtheme(s.get("name"), s.get("subtheme"))
+    category = _format_category(s.get("theme"))
 
     is_retiring = False
     if exit_date_str:
@@ -188,11 +222,12 @@ async def _lookup_brickset(
             pass
 
     return SetMetadata(
-        name=s.get("name"),
+        name=enriched_name,
         rrp_gbp=round(float(rrp), 2) if rrp else None,
         is_retiring=is_retiring,
         image_url=image_url,
         source="brickset",
+        category=category,
     )
 
 
