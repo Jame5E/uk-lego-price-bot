@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("lego_bot")
 
-COMMAND_TIMEOUT_SECONDS = 45.0
+COMMAND_TIMEOUT_SECONDS = 180.0
 
 
 def format_pings(
@@ -446,37 +446,56 @@ class LegoTrackerBot(discord.Client):
                 logger.error("Could not fetch alert channel %s: %s", self.config.channel_id, exc)
                 return [make_error_embed("Channel Error", f"Could not access alert channel {self.config.channel_id}.")]
 
-        result_embeds: list[discord.Embed] = []
-        for item in items:
-            rrp = item.rrp_gbp
-            is_retiring = item.is_retiring
-            image_url = item.image_url
-            resolved_name = item.name
-            category = item.category
+        sem = asyncio.Semaphore(6)
 
-            needs_meta = (
-                rrp <= 0
-                or not image_url
-                or not category
-                or resolved_name.startswith("LEGO Set #")
-                or ":" not in resolved_name
-                or is_retiring
-            )
-            if needs_meta and item.set_number:
-                meta = await lookup_set_metadata(
-                    self.http_session, item.set_number, brickset_api_key=self.config.brickset_api_key
+        async def _fetch_for_item(item: TrackedItem):
+            async with sem:
+                rrp = item.rrp_gbp
+                is_retiring = item.is_retiring
+                image_url = item.image_url
+                resolved_name = item.name
+                category = item.category
+
+                needs_meta = (
+                    rrp <= 0
+                    or not image_url
+                    or not category
+                    or resolved_name.startswith("LEGO Set #")
+                    or ":" not in resolved_name
+                    or is_retiring
                 )
-                if meta.name and (resolved_name.startswith("LEGO Set #") or len(meta.name) > len(resolved_name)):
-                    resolved_name = meta.name
-                if not category and meta.category:
-                    category = meta.category
-                if rrp <= 0 and meta.rrp_gbp:
-                    rrp = meta.rrp_gbp
-                if meta.source in ("brickset", "brickset_web", "lego_uk"):
-                    is_retiring = meta.is_retiring
-                if not image_url and meta.image_url:
-                    image_url = meta.image_url
+                meta = None
+                if needs_meta and item.set_number:
+                    meta = await lookup_set_metadata(
+                        self.http_session, item.set_number, brickset_api_key=self.config.brickset_api_key
+                    )
+                    if meta.name and (resolved_name.startswith("LEGO Set #") or len(meta.name) > len(resolved_name)):
+                        resolved_name = meta.name
+                    if not category and meta.category:
+                        category = meta.category
+                    if rrp <= 0 and meta.rrp_gbp:
+                        rrp = meta.rrp_gbp
+                    if meta.source in ("brickset", "brickset_web", "lego_uk"):
+                        is_retiring = meta.is_retiring
+                    if not image_url and meta.image_url:
+                        image_url = meta.image_url
 
+                best_offer, notes = await find_best_uk_offer(
+                    self.http_session,
+                    name=resolved_name,
+                    set_number=item.set_number,
+                    direct_url=item.url,
+                    has_amazon_prime=self.config.has_amazon_prime,
+                    prefer_click_and_collect=self.config.prefer_click_and_collect,
+                    keepa_api_key=self.config.keepa_api_key,
+                )
+                return item, meta, resolved_name, category, rrp, is_retiring, image_url, best_offer, notes
+
+        fetched = await asyncio.gather(*(_fetch_for_item(it) for it in items))
+
+        result_embeds: list[discord.Embed] = []
+        for item, meta, resolved_name, category, rrp, is_retiring, image_url, best_offer, notes in fetched:
+            if meta is not None:
                 self.db.update_item(
                     item.id,
                     name=resolved_name,
@@ -499,25 +518,21 @@ class LegoTrackerBot(discord.Client):
                         },
                     )
 
-            best_offer, _notes = await find_best_uk_offer(
-                self.http_session,
-                name=item.name,
-                set_number=item.set_number,
-                direct_url=item.url,
-                has_amazon_prime=self.config.has_amazon_prime,
-                prefer_click_and_collect=self.config.prefer_click_and_collect,
-                keepa_api_key=self.config.keepa_api_key,
-            )
             title = format_item_title(item)
             box_art = item.image_url or default_box_art_url(item.set_number)
             cat_line = f"📂 **Category:** {item.category}\n" if item.category else ""
 
             if best_offer is None:
                 rrp_line = f"💷 **Normal RRP:** £{rrp:.2f}\n" if rrp > 0 else ""
+                diag = "\n".join(f"• {n}" for n in notes[:5]) if notes else "No retailers responded."
                 result_embeds.append(
                     make_status_embed(
                         f"🧩 {title}",
-                        f"{cat_line}{rrp_line}⚠️ No live UK offers found right now *(retailers blocked automated check)*",
+                        (
+                            f"{cat_line}{rrp_line}"
+                            f"⚠️ **No live UK offers found right now**\n"
+                            f"*Sources checked:*\n{diag}"
+                        ),
                         color=discord.Color.orange(),
                         image_url=box_art,
                         footer="Prices in GBP (£) including estimated UK delivery",
