@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import logging
 from typing import Optional
 
@@ -8,11 +9,13 @@ import discord
 from discord import app_commands
 from discord.ext import tasks
 
+from .chart import generate_price_chart
 from .config import Config
 from .db import PriceDatabase, TrackedItem
 from .predictor import PriceAnalysis, analyze_price
-from .scraper import fetch_price_for_url
 from .shipping import UKRetailer, detect_retailer_from_url, estimate_uk_shipping
+from .uk_finder import default_box_art_url, find_best_uk_offer, lookup_set_metadata
+from .wishlist_store import remove_wishlist_entry, upsert_wishlist_entry
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,12 +24,20 @@ logging.basicConfig(
 logger = logging.getLogger("lego_bot")
 
 
+def format_pings(default_user_id: int, item: TrackedItem) -> str:
+    ids = list(item.notify_user_ids) if item.notify_user_ids else [str(default_user_id)]
+    return " ".join(f"<@{uid}>" for uid in dict.fromkeys(ids))
+
+
 def build_alert_embed(
     item: TrackedItem,
     analysis: PriceAnalysis,
     retailer: UKRetailer,
     shipping_note: str,
+    offer_url: str | None = None,
     *,
+    is_all_time_low: bool = False,
+    has_chart: bool = False,
     simulated: bool = False,
 ) -> discord.Embed:
     if "BUY NOW" in analysis.verdict:
@@ -37,13 +48,20 @@ def build_alert_embed(
         color = discord.Color.orange()
 
     title_prefix = "[TEST] " if simulated else ""
+    atl_badge = "🔥 NEW ALL-TIME LOW! " if is_all_time_low else ""
     set_tag = f" (#{item.set_number})" if item.set_number else ""
+    link_url = offer_url or item.url
+
     embed = discord.Embed(
-        title=f"{title_prefix}LEGO Deal Alert: {item.name}{set_tag}",
-        url=item.url or discord.Embed.Empty,
-        description=f"Spotted on sale at **{retailer.display_name}**!",
+        title=f"{title_prefix}{atl_badge}LEGO Deal Alert: {item.name}{set_tag}",
+        url=link_url or discord.Embed.Empty,
+        description=f"Best in-stock UK price spotted at **{retailer.display_name}**!",
         color=color,
     )
+
+    thumb = item.image_url or default_box_art_url(item.set_number)
+    if thumb:
+        embed.set_thumbnail(url=thumb)
 
     embed.add_field(
         name="Price Breakdown (GBP)",
@@ -66,6 +84,8 @@ def build_alert_embed(
     )
 
     history_lines = []
+    if is_all_time_low:
+        history_lines.append("🔥 **NEW ALL-TIME LOW** in your tracked history!")
     if analysis.historical_low_gbp is not None:
         history_lines.append(f"**Tracked Low:** £{analysis.historical_low_gbp:.2f}")
     if analysis.historical_avg_gbp is not None:
@@ -81,8 +101,10 @@ def build_alert_embed(
         inline=False,
     )
 
-    if item.url:
-        embed.add_field(name="Link", value=f"[View on {retailer.display_name}]({item.url})", inline=False)
+    if link_url:
+        embed.add_field(name="Link", value=f"[View on {retailer.display_name}]({link_url})", inline=False)
+    if has_chart:
+        embed.set_image(url="attachment://chart.png")
 
     embed.set_footer(text=f"Wishlist ID #{item.id} • Prices in GBP (£) including UK shipping")
     return embed
@@ -132,10 +154,13 @@ class LegoTrackerBot(discord.Client):
     async def before_price_check_loop(self) -> None:
         await self.wait_until_ready()
 
-    async def run_price_checks(self, item_id: int | None = None) -> list[str]:
+    async def run_price_checks(self, set_number: str | None = None) -> list[str]:
         assert self.http_session is not None
-        items = [self.db.get_item(item_id)] if item_id is not None else self.db.list_items()
-        items = [i for i in items if i is not None]
+        if set_number:
+            found = self.db.get_item_by_set_number(set_number)
+            items = [found] if found else []
+        else:
+            items = self.db.list_items()
 
         if not items:
             return ["No tracked LEGO items found."]
@@ -150,212 +175,355 @@ class LegoTrackerBot(discord.Client):
 
         summaries: list[str] = []
         for item in items:
-            if not item.url:
-                summaries.append(f"#{item.id} {item.name}: skipped (no URL)")
-                continue
+            rrp = item.rrp_gbp
+            is_retiring = item.is_retiring
+            image_url = item.image_url
 
-            result = await fetch_price_for_url(
+            if (rrp <= 0 or not is_retiring or not image_url) and item.set_number:
+                meta = await lookup_set_metadata(
+                    self.http_session, item.set_number, brickset_api_key=self.config.brickset_api_key
+                )
+                if rrp <= 0 and meta.rrp_gbp:
+                    rrp = meta.rrp_gbp
+                if meta.is_retiring:
+                    is_retiring = True
+                if not image_url and meta.image_url:
+                    image_url = meta.image_url
+                self.db.update_item(
+                    item.id,
+                    rrp_gbp=rrp if rrp > 0 else None,
+                    is_retiring=is_retiring,
+                    image_url=image_url,
+                )
+                item = self.db.get_item(item.id) or item
+
+            best_offer, notes = await find_best_uk_offer(
                 self.http_session,
-                item.url,
-                keepa_api_key=self.config.keepa_api_key,
-            )
-            if not result.ok or result.quote is None:
-                summaries.append(f"#{item.id} {item.name}: {result.error}")
-                continue
-
-            quote = result.quote
-            shipping = estimate_uk_shipping(
-                quote.price_gbp,
-                quote.retailer,
+                name=item.name,
+                set_number=item.set_number,
+                direct_url=item.url,
                 has_amazon_prime=self.config.has_amazon_prime,
                 prefer_click_and_collect=self.config.prefer_click_and_collect,
+                keepa_api_key=self.config.keepa_api_key,
             )
+            if best_offer is None:
+                summaries.append(f"#{item.set_number or item.id} {item.name}: no in-stock UK offers ({'; '.join(notes)})")
+                continue
+
+            if rrp <= 0:
+                rrp = best_offer.item_price_gbp
+
+            prev_low = self.db.get_historical_low(item.id)
+            is_all_time_low = prev_low is not None and best_offer.total_gbp < prev_low
 
             history = self.db.get_price_history(item.id, limit=90)
             hist_totals = [h.total_gbp for h in history]
-            if quote.historical_low_gbp is not None:
-                hist_totals.append(quote.historical_low_gbp)
-            if quote.historical_avg_gbp is not None:
-                hist_totals.append(quote.historical_avg_gbp)
+            if best_offer.historical_low_gbp is not None:
+                hist_totals.append(best_offer.historical_low_gbp)
+            if best_offer.historical_avg_gbp is not None:
+                hist_totals.append(best_offer.historical_avg_gbp)
 
             self.db.record_price(
                 item.id,
-                quote.price_gbp,
-                shipping.shipping_gbp,
-                shipping.total_gbp,
-                quote.retailer.value,
+                best_offer.item_price_gbp,
+                best_offer.shipping_gbp,
+                best_offer.total_gbp,
+                best_offer.retailer.value,
             )
 
             analysis = analyze_price(
-                rrp_gbp=item.rrp_gbp,
-                item_price_gbp=quote.price_gbp,
-                shipping_gbp=shipping.shipping_gbp,
+                rrp_gbp=rrp,
+                item_price_gbp=best_offer.item_price_gbp,
+                shipping_gbp=best_offer.shipping_gbp,
                 historical_totals_gbp=hist_totals,
-                is_retiring=item.is_retiring,
+                is_retiring=is_retiring,
             )
-
-            hit_target = (
-                item.target_price_gbp is not None and analysis.total_gbp <= item.target_price_gbp
-            )
-            hit_discount = analysis.discount_pct >= item.min_discount_pct
 
             summaries.append(
-                f"#{item.id} {item.name}: £{analysis.total_gbp:.2f} "
-                f"({analysis.discount_pct:.1f}% off) -> {analysis.verdict}"
+                f"#{item.set_number or item.id} {item.name}: £{analysis.total_gbp:.2f} at "
+                f"{best_offer.retailer.display_name} ({analysis.discount_pct:.1f}% off) -> {analysis.verdict}"
             )
 
+            hit_target = item.target_price_gbp is not None and analysis.total_gbp <= item.target_price_gbp
+            hit_discount = analysis.discount_pct >= item.min_discount_pct
             if (hit_target or hit_discount) and self.db.should_alert(
                 item, analysis.total_gbp, self.config.alert_cooldown_hours
             ):
-                embed = build_alert_embed(item, analysis, quote.retailer, shipping.note)
+                series = list(reversed([h.total_gbp for h in self.db.get_price_history(item.id, limit=30)]))
+                chart_bytes = generate_price_chart(series, rrp) if len(series) >= 2 else None
+                embed = build_alert_embed(
+                    item,
+                    analysis,
+                    best_offer.retailer,
+                    best_offer.shipping_note,
+                    offer_url=best_offer.url,
+                    is_all_time_low=is_all_time_low,
+                    has_chart=chart_bytes is not None,
+                )
                 if isinstance(channel, discord.abc.Messageable):
-                    await channel.send(
-                        content=f"<@{self.config.user_id}> LEGO sale spotted!",
-                        embed=embed,
-                    )
+                    pings = format_pings(self.config.user_id, item)
+                    if chart_bytes:
+                        file = discord.File(io.BytesIO(chart_bytes), filename="chart.png")
+                        await channel.send(content=f"{pings} LEGO sale spotted!", embed=embed, file=file)
+                    else:
+                        await channel.send(content=f"{pings} LEGO sale spotted!", embed=embed)
                     self.db.mark_alerted(item.id, analysis.total_gbp)
+
+        if not set_number and self.db.should_send_weekly_summary() and isinstance(channel, discord.abc.Messageable):
+            lines = []
+            for item in self.db.list_items():
+                hist = self.db.get_price_history(item.id, limit=1)
+                low = self.db.get_historical_low(item.id)
+                if hist:
+                    low_str = f" | Low £{low:.2f}" if low is not None else ""
+                    lines.append(f"• **{item.name}** (#{item.set_number or item.id}): **£{hist[0].total_gbp:.2f}**{low_str}")
+                else:
+                    lines.append(f"• **{item.name}** (#{item.set_number or item.id}): *No price recorded yet*")
+            summary_embed = discord.Embed(
+                title="Weekly UK LEGO Wishlist Summary",
+                description="\n".join(lines) if lines else "Your wishlist is empty.",
+                color=discord.Color.blue(),
+            )
+            await channel.send(content=f"<@{self.config.user_id}> Weekly LEGO summary!", embed=summary_embed)
+            self.db.mark_weekly_summary_sent()
 
         return summaries
 
     def _register_commands(self) -> None:
-        @self.tree.command(name="track", description="Add a LEGO set or piece to your UK price watchlist")
+        wishlist_group = app_commands.Group(name="wishlist", description="Manage your UK LEGO wishlist")
+        item_group = app_commands.Group(name="item", description="Item actions and notifications")
+
+        @wishlist_group.command(name="add", description="Add a LEGO set to your wishlist using just its set number")
         @app_commands.describe(
-            name="Name of the LEGO set or piece",
-            rrp_gbp="Normal UK retail price (RRP) in GBP (£)",
-            url="UK retailer URL (Amazon UK, Argos, LEGO.com, Smyths, John Lewis)",
-            set_number="Optional LEGO set or part number (e.g. 10316)",
-            target_price_gbp="Alert when total cost (inc. shipping) is at or below this £ amount",
+            set_number="LEGO set number (e.g. 10316)",
+            name="Optional custom name (auto-fetched if left blank)",
             min_discount_pct="Alert when total discount is at least this % off RRP (default 15%)",
-            is_retiring="Set True if this LEGO set is retiring soon",
+            target_price_gbp="Optional target price in £ (including shipping)",
         )
-        async def track_cmd(
+        async def wishlist_add(
             interaction: discord.Interaction,
-            name: str,
-            rrp_gbp: float,
-            url: Optional[str] = None,
-            set_number: Optional[str] = None,
-            target_price_gbp: Optional[float] = None,
+            set_number: str,
+            name: Optional[str] = None,
             min_discount_pct: float = 15.0,
-            is_retiring: bool = False,
+            target_price_gbp: Optional[float] = None,
         ) -> None:
-            retailer = detect_retailer_from_url(url)
+            await interaction.response.defer(ephemeral=True)
+            assert self.http_session is not None
+            clean_num = set_number.strip().split("-")[0]
+            meta = await lookup_set_metadata(
+                self.http_session, clean_num, brickset_api_key=self.config.brickset_api_key
+            )
+            resolved_name = name or meta.name or f"LEGO Set #{clean_num}"
+            rrp = meta.rrp_gbp or 0.0
+            notify_ids = [str(interaction.user.id)]
+
+            existing = self.db.get_item_by_set_number(clean_num)
+            if existing:
+                await interaction.followup.send(
+                    f"Set **#{clean_num} {existing.name}** is already on your wishlist!", ephemeral=True
+                )
+                return
+
             item = self.db.add_item(
-                name=name,
-                rrp_gbp=rrp_gbp,
-                set_number=set_number,
+                name=resolved_name,
+                rrp_gbp=rrp,
+                set_number=clean_num,
                 target_price_gbp=target_price_gbp,
                 min_discount_pct=min_discount_pct,
-                url=url,
-                retailer=retailer.value,
-                is_retiring=is_retiring,
+                is_retiring=meta.is_retiring,
+                image_url=meta.image_url,
+                notify_user_ids=notify_ids,
             )
-            target_str = f"£{item.target_price_gbp:.2f}" if item.target_price_gbp else "None"
-            await interaction.response.send_message(
-                f"Added **#{item.id} {item.name}** (RRP £{item.rrp_gbp:.2f}, "
-                f"Retailer: {retailer.display_name}, Min Discount: {item.min_discount_pct:.0f}%, "
-                f"Target: {target_str}).",
+            upsert_wishlist_entry(
+                self.config.wishlist_path,
+                {
+                    "name": item.name,
+                    "set_number": clean_num,
+                    "rrp_gbp": rrp if rrp > 0 else None,
+                    "target_price_gbp": target_price_gbp,
+                    "min_discount_pct": min_discount_pct,
+                    "is_retiring": meta.is_retiring,
+                    "image_url": meta.image_url,
+                    "notify_user_ids": notify_ids,
+                },
+            )
+            rrp_msg = f"£{rrp:.2f}" if rrp > 0 else "Auto-detect on next check"
+            retire_msg = "Yes" if meta.is_retiring else "No"
+            await interaction.followup.send(
+                f"Added **#{clean_num} {item.name}** to `wishlist.json`!\n"
+                f"RRP: **{rrp_msg}** | Retiring Soon: **{retire_msg}** | Notify: <@{interaction.user.id}>",
                 ephemeral=True,
             )
 
-        @self.tree.command(name="wishlist", description="Show all LEGO items you are tracking")
-        async def wishlist_cmd(interaction: discord.Interaction) -> None:
+        @wishlist_group.command(name="list", description="List all LEGO sets on your wishlist")
+        async def wishlist_list(interaction: discord.Interaction) -> None:
             items = self.db.list_items()
             if not items:
-                await interaction.response.send_message("Your LEGO wishlist is empty. Use `/track` to add one!", ephemeral=True)
+                await interaction.response.send_message(
+                    "Your wishlist is empty. Use `/wishlist add <set_number>`!", ephemeral=True
+                )
                 return
-
             lines = []
             for item in items:
-                history = self.db.get_price_history(item.id, limit=1)
-                latest = f"Latest: £{history[0].total_gbp:.2f}" if history else "No price checked yet"
-                retiring = " [Retiring]" if item.is_retiring else ""
+                hist = self.db.get_price_history(item.id, limit=1)
+                latest = f"Latest: £{hist[0].total_gbp:.2f}" if hist else "Not checked yet"
+                rrp_str = f"£{item.rrp_gbp:.2f}" if item.rrp_gbp > 0 else "Auto"
+                pings = format_pings(self.config.user_id, item)
                 lines.append(
-                    f"**#{item.id}** {item.name}{retiring} — RRP £{item.rrp_gbp:.2f} | "
-                    f"Alert ≥{item.min_discount_pct:.0f}% off | {latest}"
+                    f"**#{item.set_number or item.id}** {item.name} — RRP {rrp_str} | "
+                    f"Alert ≥{item.min_discount_pct:.0f}% off | {latest} | Pings: {pings}"
                 )
             await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
-        @self.tree.command(name="check", description="Check UK prices right now")
-        @app_commands.describe(item_id="Optional specific wishlist ID to check")
-        async def check_cmd(
+        @wishlist_group.command(name="edit", description="Edit alert settings for a tracked LEGO set")
+        @app_commands.describe(
+            set_number="LEGO set number (e.g. 10316)",
+            target_price_gbp="New target price in £",
+            min_discount_pct="New minimum discount %",
+            is_retiring="Mark as retiring soon (True/False)",
+        )
+        async def wishlist_edit(
             interaction: discord.Interaction,
-            item_id: Optional[int] = None,
+            set_number: str,
+            target_price_gbp: Optional[float] = None,
+            min_discount_pct: Optional[float] = None,
+            is_retiring: Optional[bool] = None,
         ) -> None:
+            item = self.db.get_item_by_set_number(set_number)
+            if not item:
+                await interaction.response.send_message(f"Set #{set_number} not found.", ephemeral=True)
+                return
+            updated = self.db.update_item(
+                item.id,
+                target_price_gbp=target_price_gbp,
+                min_discount_pct=min_discount_pct,
+                is_retiring=is_retiring,
+            )
+            assert updated is not None
+            upsert_wishlist_entry(
+                self.config.wishlist_path,
+                {
+                    "name": updated.name,
+                    "set_number": updated.set_number,
+                    "target_price_gbp": updated.target_price_gbp,
+                    "min_discount_pct": updated.min_discount_pct,
+                    "is_retiring": updated.is_retiring,
+                },
+            )
+            await interaction.response.send_message(
+                f"Updated **#{updated.set_number} {updated.name}** "
+                f"(Min discount: {updated.min_discount_pct:.0f}%, Target: "
+                f"{f'£{updated.target_price_gbp:.2f}' if updated.target_price_gbp else 'None'}, "
+                f"Retiring: {updated.is_retiring}).",
+                ephemeral=True,
+            )
+
+        @wishlist_group.command(name="remove", description="Remove a LEGO set from your wishlist")
+        @app_commands.describe(set_number="LEGO set number to remove (e.g. 10316)")
+        async def wishlist_remove(interaction: discord.Interaction, set_number: str) -> None:
+            item = self.db.get_item_by_set_number(set_number)
+            if not item:
+                await interaction.response.send_message(f"Set #{set_number} not found.", ephemeral=True)
+                return
+            self.db.remove_item(item.id)
+            remove_wishlist_entry(self.config.wishlist_path, set_number)
+            await interaction.response.send_message(f"Removed **#{set_number} {item.name}** from your wishlist.", ephemeral=True)
+
+        @item_group.command(name="notify", description="Toggle who gets pinged when a LEGO set goes on sale")
+        @app_commands.describe(set_number="LEGO set number (e.g. 10316)", user="Discord user to add/remove from pings")
+        async def item_notify(interaction: discord.Interaction, set_number: str, user: discord.User) -> None:
+            item = self.db.get_item_by_set_number(set_number)
+            if not item:
+                await interaction.response.send_message(f"Set #{set_number} not found.", ephemeral=True)
+                return
+            uid = str(user.id)
+            current = list(item.notify_user_ids) if item.notify_user_ids else [str(self.config.user_id)]
+            if uid in current:
+                current.remove(uid)
+                action = f"Removed <@{uid}> from"
+            else:
+                current.append(uid)
+                action = f"Added <@{uid}> to"
+            updated = self.db.update_item(item.id, notify_user_ids=current)
+            assert updated is not None
+            upsert_wishlist_entry(
+                self.config.wishlist_path,
+                {"name": updated.name, "set_number": updated.set_number, "notify_user_ids": list(updated.notify_user_ids)},
+            )
+            await interaction.response.send_message(
+                f"{action} notifications for **#{set_number} {item.name}**. "
+                f"Current pings: {format_pings(self.config.user_id, updated)}",
+                ephemeral=True,
+            )
+
+        @item_group.command(name="check", description="Check UK prices right now")
+        @app_commands.describe(set_number="Optional specific LEGO set number to check")
+        async def item_check(interaction: discord.Interaction, set_number: Optional[str] = None) -> None:
             await interaction.response.defer(ephemeral=True)
-            results = await self.run_price_checks(item_id=item_id)
+            results = await self.run_price_checks(set_number=set_number)
             await interaction.followup.send("\n".join(results), ephemeral=True)
 
-        @self.tree.command(name="history", description="View recent UK price history for a tracked item")
-        @app_commands.describe(item_id="Wishlist ID from /wishlist")
-        async def history_cmd(interaction: discord.Interaction, item_id: int) -> None:
-            item = self.db.get_item(item_id)
+        @item_group.command(name="history", description="View recent UK price history for a set")
+        @app_commands.describe(set_number="LEGO set number (e.g. 10316)")
+        async def item_history(interaction: discord.Interaction, set_number: str) -> None:
+            item = self.db.get_item_by_set_number(set_number)
             if not item:
-                await interaction.response.send_message(f"Item #{item_id} not found.", ephemeral=True)
+                await interaction.response.send_message(f"Set #{set_number} not found.", ephemeral=True)
                 return
-            records = self.db.get_price_history(item_id, limit=10)
+            records = self.db.get_price_history(item.id, limit=10)
             if not records:
-                await interaction.response.send_message(f"No price history recorded yet for **#{item.id} {item.name}**.", ephemeral=True)
+                await interaction.response.send_message(f"No price history recorded yet for **#{set_number} {item.name}**.", ephemeral=True)
                 return
             lowest = min(r.total_gbp for r in records)
-            lines = [f"**#{item.id} {item.name}** (RRP £{item.rrp_gbp:.2f} | Recent Low £{lowest:.2f}):"]
+            lines = [f"**#{set_number} {item.name}** (RRP £{item.rrp_gbp:.2f} | Recent Low £{lowest:.2f}):"]
             for r in records:
-                lines.append(f"- {r.recorded_at[:10]}: £{r.total_gbp:.2f} (£{r.price_gbp:.2f} + £{r.shipping_gbp:.2f} ship)")
+                lines.append(f"- {r.recorded_at[:10]}: £{r.total_gbp:.2f} at {r.retailer}")
             await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
-        @self.tree.command(name="remove", description="Remove a LEGO item from your wishlist")
-        @app_commands.describe(item_id="Wishlist ID from /wishlist")
-        async def remove_cmd(interaction: discord.Interaction, item_id: int) -> None:
-            removed = self.db.remove_item(item_id)
-            msg = f"Removed item #{item_id}." if removed else f"Item #{item_id} not found."
-            await interaction.response.send_message(msg, ephemeral=True)
-
-        @self.tree.command(name="simulate_sale", description="Send a test deal alert ping in your alert channel")
-        @app_commands.describe(
-            item_id="Wishlist ID from /wishlist",
-            sale_price_gbp="Simulated UK item price in £ (before shipping)",
-        )
-        async def simulate_sale_cmd(
-            interaction: discord.Interaction,
-            item_id: int,
-            sale_price_gbp: float,
-        ) -> None:
-            item = self.db.get_item(item_id)
+        @item_group.command(name="simulate_sale", description="Send a test deal alert with chart & box art in your alert channel")
+        @app_commands.describe(set_number="LEGO set number", sale_price_gbp="Simulated UK item price in £")
+        async def item_simulate(interaction: discord.Interaction, set_number: str, sale_price_gbp: float) -> None:
+            item = self.db.get_item_by_set_number(set_number)
             if not item:
-                await interaction.response.send_message(f"Item #{item_id} not found.", ephemeral=True)
+                await interaction.response.send_message(f"Set #{set_number} not found.", ephemeral=True)
                 return
-
-            retailer = detect_retailer_from_url(item.url)
-            if retailer == UKRetailer.OTHER:
-                try:
-                    retailer = UKRetailer(item.retailer)
-                except ValueError:
-                    retailer = UKRetailer.ARGOS
-
+            rrp = item.rrp_gbp if item.rrp_gbp > 0 else round(sale_price_gbp * 1.3, 2)
+            retailer = detect_retailer_from_url(item.url) if item.url else UKRetailer.ARGOS
             shipping = estimate_uk_shipping(
                 sale_price_gbp,
                 retailer,
                 has_amazon_prime=self.config.has_amazon_prime,
                 prefer_click_and_collect=self.config.prefer_click_and_collect,
             )
-            hist = [h.total_gbp for h in self.db.get_price_history(item.id, limit=90)]
+            series = [rrp, round(rrp * 0.9, 2), round(rrp * 0.82, 2), shipping.total_gbp]
+            chart_bytes = generate_price_chart(series, rrp)
             analysis = analyze_price(
-                rrp_gbp=item.rrp_gbp,
+                rrp_gbp=rrp,
                 item_price_gbp=sale_price_gbp,
                 shipping_gbp=shipping.shipping_gbp,
-                historical_totals_gbp=hist,
+                historical_totals_gbp=series[:-1],
                 is_retiring=item.is_retiring,
             )
-            embed = build_alert_embed(item, analysis, retailer, shipping.note, simulated=True)
-
+            embed = build_alert_embed(
+                item,
+                analysis,
+                retailer,
+                shipping.note,
+                is_all_time_low=True,
+                has_chart=True,
+                simulated=True,
+            )
             channel = self.get_channel(self.config.channel_id) or await self.fetch_channel(self.config.channel_id)
             if isinstance(channel, discord.abc.Messageable):
-                await channel.send(
-                    content=f"<@{self.config.user_id}> LEGO sale spotted!",
-                    embed=embed,
-                )
-                await interaction.response.send_message("Sent test alert to your alert channel!", ephemeral=True)
+                pings = format_pings(self.config.user_id, item)
+                file = discord.File(io.BytesIO(chart_bytes), filename="chart.png")
+                await channel.send(content=f"{pings} LEGO sale spotted!", embed=embed, file=file)
+                await interaction.response.send_message("Sent test alert with chart!", ephemeral=True)
             else:
                 await interaction.response.send_message("Alert channel is not messageable.", ephemeral=True)
+
+        self.tree.add_command(wishlist_group)
+        self.tree.add_command(item_group)
 
 
 def main() -> None:
