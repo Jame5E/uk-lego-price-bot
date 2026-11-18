@@ -20,6 +20,7 @@ class Config:
     keepa_api_key: str | None
     brickset_api_key: str | None
     extra_notify_user_ids: tuple[str, ...] = ("942902769319292948",)
+    proxy_url: str | None = None
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -53,4 +54,5 @@ class Config:
             keepa_api_key=os.getenv("KEEPA_API_KEY", "").strip() or None,
             brickset_api_key=os.getenv("BRICKSET_API_KEY", "").strip() or None,
             extra_notify_user_ids=extra_ids,
+            proxy_url=os.getenv("PROXY_URL", "").strip() or None,
         )
