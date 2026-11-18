@@ -188,13 +188,21 @@ class _PingUserSelect(discord.ui.UserSelect):
 
 
 class _PingSetSelect(discord.ui.Select):
-    def __init__(self, options: list[discord.SelectOption]) -> None:
+    def __init__(
+        self,
+        options: list[discord.SelectOption],
+        chunk_keys: set[str],
+        *,
+        placeholder: str,
+        row: int,
+    ) -> None:
+        self.chunk_keys = chunk_keys
         super().__init__(
-            placeholder="2. Check/uncheck sets for this user...",
+            placeholder=placeholder,
             min_values=0,
             max_values=len(options),
             options=options,
-            row=1,
+            row=row,
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
@@ -210,6 +218,8 @@ class _PingSetSelect(discord.ui.Select):
         uid = str(view.target_user.id)
         for item in view.bot.db.list_items():
             key = item.set_number or str(item.id)
+            if key not in self.chunk_keys:
+                continue
             current = (
                 list(item.notify_user_ids)
                 if item.notify_user_ids
@@ -255,37 +265,49 @@ class PingManagerView(discord.ui.View):
         items = self.bot.db.list_items()
         if self.target_user and items:
             uid = str(self.target_user.id)
-            options: list[discord.SelectOption] = []
-            for item in items[:25]:
-                key = item.set_number or str(item.id)
-                current = (
-                    list(item.notify_user_ids)
-                    if item.notify_user_ids
-                    else list(dict.fromkeys([str(self.bot.config.user_id), *self.bot.config.extra_notify_user_ids]))
-                )
-                label = format_item_title(item)[:100]
-                desc = (item.category or "LEGO Set")[:100]
-                options.append(
-                    discord.SelectOption(
-                        label=label,
-                        value=key,
-                        description=desc,
-                        default=(uid in current),
+            chunks = [items[i : i + 25] for i in range(0, min(len(items), 75), 25)]
+            for idx, chunk in enumerate(chunks):
+                options: list[discord.SelectOption] = []
+                chunk_keys: set[str] = set()
+                for item in chunk:
+                    key = item.set_number or str(item.id)
+                    chunk_keys.add(key)
+                    current = (
+                        list(item.notify_user_ids)
+                        if item.notify_user_ids
+                        else list(dict.fromkeys([str(self.bot.config.user_id), *self.bot.config.extra_notify_user_ids]))
                     )
+                    label = format_item_title(item)[:100]
+                    desc = (item.category or "LEGO Set")[:100]
+                    options.append(
+                        discord.SelectOption(
+                            label=label,
+                            value=key,
+                            description=desc,
+                            default=(uid in current),
+                        )
+                    )
+                start_n = idx * 25 + 1
+                end_n = idx * 25 + len(chunk)
+                placeholder = (
+                    "2. Check/uncheck sets for this user..."
+                    if len(chunks) == 1
+                    else f"2. Check/uncheck sets ({start_n}–{end_n})..."
                 )
-            self.add_item(_PingSetSelect(options))
+                self.add_item(_PingSetSelect(options, chunk_keys, placeholder=placeholder, row=1 + idx))
 
+            btn_row = 1 + len(chunks)
             add_all_btn = discord.ui.Button(
                 label="Add to ALL",
                 emoji="✅",
                 style=discord.ButtonStyle.success,
-                row=2,
+                row=btn_row,
             )
             remove_all_btn = discord.ui.Button(
                 label="Remove from ALL",
                 emoji="🔕",
                 style=discord.ButtonStyle.danger,
-                row=2,
+                row=btn_row,
             )
 
             async def _on_add_all(interaction: discord.Interaction) -> None:
