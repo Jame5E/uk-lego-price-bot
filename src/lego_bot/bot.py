@@ -142,13 +142,10 @@ class LegoTrackerBot(discord.Client):
 
         self.price_check_loop.change_interval(minutes=self.config.check_interval_minutes)
         self.price_check_loop.start()
-        self.auto_update_loop.start()
 
     async def close(self) -> None:
         if self.price_check_loop.is_running():
             self.price_check_loop.cancel()
-        if self.auto_update_loop.is_running():
-            self.auto_update_loop.cancel()
         if self.http_session and not self.http_session.closed:
             await self.http_session.close()
         self.db.close()
@@ -156,43 +153,6 @@ class LegoTrackerBot(discord.Client):
 
     async def on_ready(self) -> None:
         logger.info("Logged in as %s (ID: %s)", self.user, self.user.id if self.user else "?")
-
-    @tasks.loop(minutes=15)
-    async def auto_update_loop(self) -> None:
-        """Check origin/main every 15 minutes; if updated, pull and exit so systemd restarts."""
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "git", "fetch", "origin", "main",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await proc.communicate()
-            if proc.returncode != 0:
-                return
-
-            count_proc = await asyncio.create_subprocess_exec(
-                "git", "rev-list", "--count", "HEAD..origin/main",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            out, _ = await count_proc.communicate()
-            if count_proc.returncode == 0 and out.decode().strip().isdigit() and int(out.decode().strip()) > 0:
-                logger.info("New commit detected on origin/main. Pulling and restarting...")
-                pull_proc = await asyncio.create_subprocess_exec(
-                    "git", "pull", "--ff-only", "origin", "main",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                await pull_proc.communicate()
-                if pull_proc.returncode == 0:
-                    await self.close()
-                    os._exit(0)
-        except Exception as exc:
-            logger.debug("Auto-update check skipped: %s", exc)
-
-    @auto_update_loop.before_loop
-    async def before_auto_update_loop(self) -> None:
-        await self.wait_until_ready()
 
     @tasks.loop(minutes=30)
     async def price_check_loop(self) -> None:
@@ -571,8 +531,42 @@ class LegoTrackerBot(discord.Client):
             else:
                 await interaction.followup.send("Alert channel is not messageable.", ephemeral=True)
 
+        @wishlist_group.command(name="check", description="Check the current UK price of all items on your wishlist")
+        async def wishlist_check(interaction: discord.Interaction) -> None:
+            await interaction.response.defer(ephemeral=True)
+            results = await self.run_price_checks(set_number=None)
+            embed = discord.Embed(
+                title="🔎 Current UK Wishlist Prices",
+                description="\n".join(results) if results else "No items on your wishlist.",
+                color=discord.Color.blue(),
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+        bot_group = app_commands.Group(name="bot", description="Bot management commands")
+
+        @bot_group.command(name="update", description="Pull the latest code from GitHub and restart the bot")
+        async def bot_update(interaction: discord.Interaction) -> None:
+            await interaction.response.defer(ephemeral=True)
+            proc = await asyncio.create_subprocess_exec(
+                "git", "pull", "--ff-only", "origin", "main",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out, err = await proc.communicate()
+            output = (out or b"").decode().strip() or (err or b"").decode().strip()
+            if proc.returncode != 0:
+                await interaction.followup.send(f"Git pull failed:\n```{output[:1500]}```", ephemeral=True)
+                return
+            if "Already up to date." in output:
+                await interaction.followup.send("Bot is already up to date!", ephemeral=True)
+                return
+            await interaction.followup.send(f"Updated from GitHub! Restarting now...\n```{output[:1000]}```", ephemeral=True)
+            await self.close()
+            os._exit(0)
+
         self.tree.add_command(wishlist_group)
         self.tree.add_command(item_group)
+        self.tree.add_command(bot_group)
 
 
 def main() -> None:
