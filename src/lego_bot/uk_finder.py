@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import quote_plus
@@ -683,6 +684,125 @@ async def _check_retailer_url(
     ], None
 
 
+_HUKD_CACHE_TTL = 600.0
+_HUKD_CACHE_XML: str | None = None
+_HUKD_CACHE_AT: float = 0.0
+
+
+def parse_hotukdeals_rss(
+    xml_text: str,
+    set_number: str,
+    *,
+    has_amazon_prime: bool = False,
+    prefer_click_and_collect: bool = False,
+) -> list[UKOffer]:
+    """Parse HotUKDeals LEGO RSS feed XML for active GBP offers matching set_number."""
+    clean_num = set_number.strip().split("-")[0]
+    if not clean_num:
+        return []
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return []
+
+    num_re = re.compile(rf"\b{re.escape(clean_num)}\b")
+    retailer_map = {
+        "amazon": UKRetailer.AMAZON_UK,
+        "argos": UKRetailer.ARGOS,
+        "smyths": UKRetailer.SMYTHS,
+        "john lewis": UKRetailer.JOHN_LEWIS,
+        "lego.com": UKRetailer.LEGO_UK,
+        "lego store": UKRetailer.LEGO_UK,
+    }
+    offers: list[UKOffer] = []
+
+    for item in root.findall(".//item"):
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        desc = (item.findtext("description") or "").strip()
+        combined = f"{title} {desc}"
+        if not num_re.search(combined):
+            continue
+        lower = combined.lower()
+        if "expired" in lower or any(p in lower for p in OUT_OF_STOCK_PHRASES):
+            continue
+
+        m = re.search(r"£\s*(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)", title) or re.search(
+            r"£\s*(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)", desc
+        )
+        if not m:
+            continue
+        price = round(float(m.group(1).replace(",", "")), 2)
+        if price <= 0:
+            continue
+
+        matched = UKRetailer.OTHER
+        for kw, ret in retailer_map.items():
+            if kw in lower:
+                matched = ret
+                break
+
+        ship = estimate_uk_shipping(
+            price,
+            matched,
+            has_amazon_prime=has_amazon_prime,
+            prefer_click_and_collect=prefer_click_and_collect,
+        )
+        offers.append(
+            UKOffer(
+                retailer=matched,
+                url=link or f"https://www.hotukdeals.com/search?q=lego+{clean_num}",
+                item_price_gbp=price,
+                shipping_gbp=ship.shipping_gbp,
+                total_gbp=ship.total_gbp,
+                shipping_note=ship.note,
+            )
+        )
+
+    return offers
+
+
+async def _fetch_hotukdeals_uk(
+    session: aiohttp.ClientSession,
+    set_number: str,
+    *,
+    has_amazon_prime: bool = False,
+    prefer_click_and_collect: bool = False,
+) -> tuple[list[UKOffer], str | None]:
+    """Check HotUKDeals UK LEGO RSS feed (cached 10 minutes to avoid extra requests)."""
+    global _HUKD_CACHE_XML, _HUKD_CACHE_AT
+
+    if _is_source_cooled_down("hotukdeals_uk"):
+        return [], "HotUKDeals UK: temporarily skipped (cooldown)"
+
+    now = time.monotonic()
+    xml_text = _HUKD_CACHE_XML if (_HUKD_CACHE_XML and now - _HUKD_CACHE_AT < _HUKD_CACHE_TTL) else None
+
+    if xml_text is None:
+        url = "https://www.hotukdeals.com/rss/tag/lego"
+        try:
+            async with session.get(url, headers=DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status != 200:
+                    if resp.status in (202, 403, 429, 503):
+                        _record_source_block("hotukdeals_uk")
+                    return [], f"HotUKDeals UK: HTTP {resp.status}"
+                xml_text = await resp.text()
+                _HUKD_CACHE_XML = xml_text
+                _HUKD_CACHE_AT = now
+                _record_source_ok("hotukdeals_uk")
+        except Exception as exc:
+            _record_source_block("hotukdeals_uk")
+            return [], f"HotUKDeals UK: {type(exc).__name__}"
+
+    offers = parse_hotukdeals_rss(
+        xml_text,
+        set_number,
+        has_amazon_prime=has_amazon_prime,
+        prefer_click_and_collect=prefer_click_and_collect,
+    )
+    return offers, (None if offers else "HotUKDeals UK: no active deal listed")
+
+
 async def find_best_uk_offer(
     session: aiohttp.ClientSession,
     *,
@@ -725,6 +845,14 @@ async def find_best_uk_offer(
         tasks.append(_check_keepa_search())
 
     if set_number:
+        tasks.append(
+            _fetch_hotukdeals_uk(
+                session,
+                set_number,
+                has_amazon_prime=has_amazon_prime,
+                prefer_click_and_collect=prefer_click_and_collect,
+            )
+        )
         tasks.append(
             _fetch_brickset_uk_offers(
                 session,
