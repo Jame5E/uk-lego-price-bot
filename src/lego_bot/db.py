@@ -12,6 +12,7 @@ class TrackedItem:
     id: int
     name: str
     set_number: str | None
+    category: str | None
     rrp_gbp: float
     target_price_gbp: float | None
     min_discount_pct: float
@@ -96,6 +97,8 @@ class PriceDatabase:
             self._conn.execute("ALTER TABLE tracked_items ADD COLUMN image_url TEXT")
         if "notify_user_ids" not in cols:
             self._conn.execute("ALTER TABLE tracked_items ADD COLUMN notify_user_ids TEXT NOT NULL DEFAULT '[]'")
+        if "category" not in cols:
+            self._conn.execute("ALTER TABLE tracked_items ADD COLUMN category TEXT")
         self._conn.commit()
 
     @staticmethod
@@ -104,7 +107,8 @@ class PriceDatabase:
 
     @staticmethod
     def _row_to_item(row: sqlite3.Row) -> TrackedItem:
-        raw_notify = row["notify_user_ids"] if "notify_user_ids" in row.keys() else "[]"
+        keys = row.keys()
+        raw_notify = row["notify_user_ids"] if "notify_user_ids" in keys else "[]"
         try:
             parsed_notify = tuple(str(u) for u in json.loads(raw_notify or "[]"))
         except json.JSONDecodeError:
@@ -114,13 +118,14 @@ class PriceDatabase:
             id=row["id"],
             name=row["name"],
             set_number=row["set_number"],
+            category=row["category"] if "category" in keys else None,
             rrp_gbp=row["rrp_gbp"],
             target_price_gbp=row["target_price_gbp"],
             min_discount_pct=row["min_discount_pct"],
             url=row["url"],
             retailer=row["retailer"],
             is_retiring=bool(row["is_retiring"]),
-            image_url=row["image_url"] if "image_url" in row.keys() else None,
+            image_url=row["image_url"] if "image_url" in keys else None,
             notify_user_ids=parsed_notify,
             last_alert_price_gbp=row["last_alert_price_gbp"],
             last_alert_at=row["last_alert_at"],
@@ -133,6 +138,7 @@ class PriceDatabase:
         rrp_gbp: float,
         *,
         set_number: str | None = None,
+        category: str | None = None,
         target_price_gbp: float | None = None,
         min_discount_pct: float = 15.0,
         url: str | None = None,
@@ -146,15 +152,16 @@ class PriceDatabase:
         cur = self._conn.execute(
             """
             INSERT INTO tracked_items (
-                name, set_number, rrp_gbp, target_price_gbp,
+                name, set_number, category, rrp_gbp, target_price_gbp,
                 min_discount_pct, url, retailer, is_retiring,
                 image_url, notify_user_ids, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 name,
                 set_number,
+                category,
                 round(rrp_gbp, 2),
                 round(target_price_gbp, 2) if target_price_gbp is not None else None,
                 round(min_discount_pct, 1),
@@ -191,6 +198,7 @@ class PriceDatabase:
         item_id: int,
         *,
         name: str | None = None,
+        category: str | None = None,
         rrp_gbp: float | None = None,
         target_price_gbp: float | None = None,
         min_discount_pct: float | None = None,
@@ -204,6 +212,9 @@ class PriceDatabase:
         if name is not None:
             fields.append("name = ?")
             values.append(name)
+        if category is not None:
+            fields.append("category = ?")
+            values.append(category)
         if rrp_gbp is not None:
             fields.append("rrp_gbp = ?")
             values.append(round(rrp_gbp, 2))
