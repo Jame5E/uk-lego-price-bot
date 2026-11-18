@@ -172,7 +172,7 @@ async def _lookup_brickset_public(
     if m:
         rrp_gbp = round(float(m.group(1)), 2)
 
-    retiring = "retiring soon" in text.lower() or "retiring soon" in availability_val
+    retiring = "retiring soon" in availability_val
     return SetMetadata(
         name=name,
         rrp_gbp=rrp_gbp,
