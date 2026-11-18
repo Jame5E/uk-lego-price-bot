@@ -170,6 +170,194 @@ def build_alert_embeds(
     return embeds
 
 
+class _PingUserSelect(discord.ui.UserSelect):
+    def __init__(self) -> None:
+        super().__init__(
+            placeholder="1. Pick a user to manage their pings...",
+            min_values=1,
+            max_values=1,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        assert isinstance(view, PingManagerView)
+        view.target_user = self.values[0]
+        view.rebuild_items()
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+
+class _PingSetSelect(discord.ui.Select):
+    def __init__(self, options: list[discord.SelectOption]) -> None:
+        super().__init__(
+            placeholder="2. Check/uncheck sets for this user...",
+            min_values=0,
+            max_values=len(options),
+            options=options,
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        assert isinstance(view, PingManagerView)
+        if not view.target_user:
+            await interaction.response.send_message(
+                embed=make_error_embed("Pick a User", "Please pick a user first."),
+                ephemeral=True,
+            )
+            return
+        selected_keys = set(self.values)
+        uid = str(view.target_user.id)
+        for item in view.bot.db.list_items():
+            key = item.set_number or str(item.id)
+            current = (
+                list(item.notify_user_ids)
+                if item.notify_user_ids
+                else list(dict.fromkeys([str(view.bot.config.user_id), *view.bot.config.extra_notify_user_ids]))
+            )
+            want = key in selected_keys
+            changed = False
+            if want and uid not in current:
+                current.append(uid)
+                changed = True
+            elif not want and uid in current:
+                current.remove(uid)
+                changed = True
+            elif not item.notify_user_ids:
+                changed = True
+
+            if changed:
+                updated = view.bot.db.update_item(item.id, notify_user_ids=current)
+                if updated and updated.set_number:
+                    upsert_wishlist_entry(
+                        view.bot.config.wishlist_path,
+                        {
+                            "name": updated.name,
+                            "set_number": updated.set_number,
+                            "notify_user_ids": list(updated.notify_user_ids),
+                        },
+                    )
+        view.rebuild_items()
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+
+class PingManagerView(discord.ui.View):
+    def __init__(self, bot: "LegoTrackerBot", target_user: discord.abc.User | None = None) -> None:
+        super().__init__(timeout=180)
+        self.bot = bot
+        self.target_user = target_user
+        self.rebuild_items()
+
+    def rebuild_items(self) -> None:
+        self.clear_items()
+        self.add_item(_PingUserSelect())
+
+        items = self.bot.db.list_items()
+        if self.target_user and items:
+            uid = str(self.target_user.id)
+            options: list[discord.SelectOption] = []
+            for item in items[:25]:
+                key = item.set_number or str(item.id)
+                current = (
+                    list(item.notify_user_ids)
+                    if item.notify_user_ids
+                    else list(dict.fromkeys([str(self.bot.config.user_id), *self.bot.config.extra_notify_user_ids]))
+                )
+                label = format_item_title(item)[:100]
+                desc = (item.category or "LEGO Set")[:100]
+                options.append(
+                    discord.SelectOption(
+                        label=label,
+                        value=key,
+                        description=desc,
+                        default=(uid in current),
+                    )
+                )
+            self.add_item(_PingSetSelect(options))
+
+            add_all_btn = discord.ui.Button(
+                label="Add to ALL",
+                emoji="✅",
+                style=discord.ButtonStyle.success,
+                row=2,
+            )
+            remove_all_btn = discord.ui.Button(
+                label="Remove from ALL",
+                emoji="🔕",
+                style=discord.ButtonStyle.danger,
+                row=2,
+            )
+
+            async def _on_add_all(interaction: discord.Interaction) -> None:
+                await self._bulk_set(interaction, add=True)
+
+            async def _on_remove_all(interaction: discord.Interaction) -> None:
+                await self._bulk_set(interaction, add=False)
+
+            add_all_btn.callback = _on_add_all
+            remove_all_btn.callback = _on_remove_all
+            self.add_item(add_all_btn)
+            self.add_item(remove_all_btn)
+
+    async def _bulk_set(self, interaction: discord.Interaction, *, add: bool) -> None:
+        if not self.target_user:
+            return
+        uid = str(self.target_user.id)
+        for item in self.bot.db.list_items():
+            current = (
+                list(item.notify_user_ids)
+                if item.notify_user_ids
+                else list(dict.fromkeys([str(self.bot.config.user_id), *self.bot.config.extra_notify_user_ids]))
+            )
+            if add and uid not in current:
+                current.append(uid)
+            elif not add and uid in current:
+                current.remove(uid)
+            updated = self.bot.db.update_item(item.id, notify_user_ids=current)
+            if updated and updated.set_number:
+                upsert_wishlist_entry(
+                    self.bot.config.wishlist_path,
+                    {
+                        "name": updated.name,
+                        "set_number": updated.set_number,
+                        "notify_user_ids": list(updated.notify_user_ids),
+                    },
+                )
+        self.rebuild_items()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    def build_embed(self) -> discord.Embed:
+        items = self.bot.db.list_items()
+        if not items:
+            return make_status_embed("🔔 Manage Pings", "Your wishlist is currently empty.")
+        if not self.target_user:
+            return make_status_embed(
+                "🔔 Interactive Ping Manager",
+                "Pick a Discord user from the dropdown below to check/uncheck which LEGO sets they get pinged for.",
+                color=discord.Color.blue(),
+            )
+        uid = str(self.target_user.id)
+        lines = []
+        for item in items:
+            current = (
+                list(item.notify_user_ids)
+                if item.notify_user_ids
+                else list(dict.fromkeys([str(self.bot.config.user_id), *self.bot.config.extra_notify_user_ids]))
+            )
+            mark = "✅" if uid in current else "⬜"
+            lines.append(f"{mark} **{format_item_title(item)}**")
+        return make_status_embed(
+            "🔔 Interactive Ping Manager",
+            (
+                f"Managing pings for <@{uid}>\n"
+                f"Use the dropdown below to check/uncheck sets, or click **Add to ALL** / **Remove from ALL**:\n\n"
+                + "\n".join(lines)
+            ),
+            color=discord.Color.blue(),
+            footer="Changes save immediately • Menu stays active for 3 minutes",
+        )
+
+
 class LegoTrackerBot(discord.Client):
     def __init__(self, config: Config) -> None:
         intents = discord.Intents.default()
@@ -818,6 +1006,12 @@ class LegoTrackerBot(discord.Client):
                 color=discord.Color.green() if action == "add" else discord.Color.orange(),
             )
             await interaction.response.send_message(embed=embed)
+
+        @item_group.command(name="pings", description="Interactive menu to check/uncheck which sets a user is pinged on")
+        @app_commands.describe(user="Optional Discord user (you can also pick from the dropdown)")
+        async def item_pings(interaction: discord.Interaction, user: Optional[discord.User] = None) -> None:
+            view = PingManagerView(self, target_user=user)
+            await interaction.response.send_message(embed=view.build_embed(), view=view)
 
         @item_group.command(name="check", description="Check UK prices right now for one set or all sets")
         @app_commands.describe(set_number="Optional specific LEGO set number to check")
