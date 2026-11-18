@@ -483,9 +483,10 @@ class LegoTrackerBot(discord.Client):
         @item_group.command(name="simulate_sale", description="Send a test deal alert with chart & box art in your alert channel")
         @app_commands.describe(set_number="LEGO set number", sale_price_gbp="Simulated UK item price in £")
         async def item_simulate(interaction: discord.Interaction, set_number: str, sale_price_gbp: float) -> None:
+            await interaction.response.defer(ephemeral=True)
             item = self.db.get_item_by_set_number(set_number)
             if not item:
-                await interaction.response.send_message(f"Set #{set_number} not found.", ephemeral=True)
+                await interaction.followup.send(f"Set #{set_number} not found.", ephemeral=True)
                 return
             rrp = item.rrp_gbp if item.rrp_gbp > 0 else round(sale_price_gbp * 1.3, 2)
             retailer = detect_retailer_from_url(item.url) if item.url else UKRetailer.ARGOS
@@ -518,9 +519,9 @@ class LegoTrackerBot(discord.Client):
                 pings = format_pings(self.config.user_id, item)
                 file = discord.File(io.BytesIO(chart_bytes), filename="chart.png")
                 await channel.send(content=f"{pings} LEGO sale spotted!", embed=embed, file=file)
-                await interaction.response.send_message("Sent test alert with chart!", ephemeral=True)
+                await interaction.followup.send("Sent test alert with chart!", ephemeral=True)
             else:
-                await interaction.response.send_message("Alert channel is not messageable.", ephemeral=True)
+                await interaction.followup.send("Alert channel is not messageable.", ephemeral=True)
 
         self.tree.add_command(wishlist_group)
         self.tree.add_command(item_group)
