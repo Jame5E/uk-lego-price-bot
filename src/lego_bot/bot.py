@@ -33,7 +33,7 @@ def format_pings(
     item: TrackedItem,
     extra_user_ids: tuple[str, ...] = ("942902769319292948",),
 ) -> str:
-    ids = [str(default_user_id), *extra_user_ids, *item.notify_user_ids]
+    ids = list(item.notify_user_ids) if item.notify_user_ids else [str(default_user_id), *extra_user_ids]
     return " ".join(f"<@{uid}>" for uid in dict.fromkeys(ids))
 
 
@@ -379,7 +379,11 @@ class LegoTrackerBot(discord.Client):
                     has_chart=chart_bytes is not None,
                 )
                 if isinstance(channel, discord.abc.Messageable):
-                    pings = format_pings(self.config.user_id, item)
+                    pings = format_pings(
+                        self.config.user_id,
+                        item,
+                        extra_user_ids=self.config.extra_notify_user_ids,
+                    )
                     if chart_bytes:
                         file = discord.File(io.BytesIO(chart_bytes), filename="chart.png")
                         await channel.send(content=f"{pings} LEGO sale spotted!", embeds=embeds, file=file)
@@ -642,7 +646,11 @@ class LegoTrackerBot(discord.Client):
                 )
                 return
             uid = str(user.id)
-            current = list(item.notify_user_ids) if item.notify_user_ids else [str(self.config.user_id)]
+            current = (
+                list(item.notify_user_ids)
+                if item.notify_user_ids
+                else list(dict.fromkeys([str(self.config.user_id), *self.config.extra_notify_user_ids]))
+            )
             if uid in current:
                 current.remove(uid)
                 action = f"Removed <@{uid}> from"
@@ -655,10 +663,52 @@ class LegoTrackerBot(discord.Client):
                 self.config.wishlist_path,
                 {"name": updated.name, "set_number": updated.set_number, "notify_user_ids": list(updated.notify_user_ids)},
             )
+            pings_text = format_pings(self.config.user_id, updated) if updated.notify_user_ids else "None (no one will be pinged)"
             embed = make_status_embed(
                 f"🔔 Notifications Updated: {format_item_title(updated)}",
-                f"{action} sale alerts.\n**Current pings:** {format_pings(self.config.user_id, updated)}",
+                f"{action} sale alerts.\n**Current pings:** {pings_text}",
                 color=discord.Color.blue(),
+                image_url=updated.image_url or default_box_art_url(updated.set_number),
+            )
+            await interaction.response.send_message(embed=embed)
+
+        @item_group.command(name="notify_remove", description="Remove a user from sale pings for a LEGO set")
+        @app_commands.describe(set_number="LEGO set number (e.g. 10316)", user="Discord user to remove from pings")
+        async def item_notify_remove(interaction: discord.Interaction, set_number: str, user: discord.User) -> None:
+            item = self.db.get_item_by_set_number(set_number)
+            if not item:
+                await interaction.response.send_message(
+                    embed=make_error_embed("Not Found", f"Set #{set_number} is not on your wishlist."),
+                    ephemeral=True,
+                )
+                return
+            uid = str(user.id)
+            current = (
+                list(item.notify_user_ids)
+                if item.notify_user_ids
+                else list(dict.fromkeys([str(self.config.user_id), *self.config.extra_notify_user_ids]))
+            )
+            if uid not in current:
+                await interaction.response.send_message(
+                    embed=make_status_embed(
+                        f"🔔 Not Listed: {format_item_title(item)}",
+                        f"<@{uid}> is not currently on the ping list for this set.\n**Current pings:** {format_pings(self.config.user_id, item)}",
+                        color=discord.Color.gold(),
+                    )
+                )
+                return
+            current.remove(uid)
+            updated = self.db.update_item(item.id, notify_user_ids=current)
+            assert updated is not None
+            upsert_wishlist_entry(
+                self.config.wishlist_path,
+                {"name": updated.name, "set_number": updated.set_number, "notify_user_ids": list(updated.notify_user_ids)},
+            )
+            pings_text = format_pings(self.config.user_id, updated) if updated.notify_user_ids else "None"
+            embed = make_status_embed(
+                f"🔕 Removed Ping: {format_item_title(updated)}",
+                f"Removed <@{uid}> from sale alerts.\n**Current pings:** {pings_text}",
+                color=discord.Color.orange(),
                 image_url=updated.image_url or default_box_art_url(updated.set_number),
             )
             await interaction.response.send_message(embed=embed)
