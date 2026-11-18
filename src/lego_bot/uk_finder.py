@@ -92,12 +92,59 @@ async def lookup_set_metadata(
     except Exception:
         pass
 
+    # Fallback 2: public Brickset set page (great for set name + UK RRP £)
+    public_meta = await _lookup_brickset_public(session, clean_num)
+    if public_meta.name or public_meta.rrp_gbp:
+        return public_meta
+
     return SetMetadata(
         name=None,
         rrp_gbp=None,
         is_retiring=False,
         image_url=default_box_art_url(clean_num),
         source="fallback",
+    )
+
+
+async def _lookup_brickset_public(
+    session: aiohttp.ClientSession,
+    set_number: str,
+) -> SetMetadata:
+    url = f"https://brickset.com/sets/{set_number}-1"
+    try:
+        async with session.get(url, headers=DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+            if resp.status != 200:
+                return SetMetadata(None, None, False, default_box_art_url(set_number), "brickset_web_err")
+            html = await resp.text()
+    except Exception:
+        return SetMetadata(None, None, False, default_box_art_url(set_number), "brickset_web_err")
+
+    soup = BeautifulSoup(html, "html.parser")
+    name: str | None = None
+    h1 = soup.find("h1")
+    if h1:
+        raw_title = h1.get_text(" ", strip=True)
+        # Brickset h1 is often "10316-1: The Lord of the Rings: Rivendell"
+        if ":" in raw_title and raw_title.split(":", 1)[0].strip().startswith(set_number):
+            name = raw_title.split(":", 1)[1].strip()
+        else:
+            name = raw_title
+
+    text = soup.get_text(" ", strip=True)
+    rrp_gbp: float | None = None
+    m = re.search(r"RRP[^£]{0,30}£\s*(\d{1,4}(?:\.\d{2})?)", text, re.IGNORECASE)
+    if not m:
+        m = re.search(r"£\s*(\d{1,4}\.\d{2})", text)
+    if m:
+        rrp_gbp = round(float(m.group(1)), 2)
+
+    retiring = "retiring soon" in text.lower() or "retired" in text.lower()
+    return SetMetadata(
+        name=name,
+        rrp_gbp=rrp_gbp,
+        is_retiring=retiring,
+        image_url=default_box_art_url(set_number),
+        source="brickset_web",
     )
 
 
