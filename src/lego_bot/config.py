@@ -19,6 +19,7 @@ class Config:
     prefer_click_and_collect: bool
     keepa_api_key: str | None
     brickset_api_key: str | None
+    extra_notify_user_ids: tuple[str, ...] = ("942902769319292948",)
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -28,6 +29,8 @@ class Config:
         channel_raw = os.getenv("DISCORD_CHANNEL_ID", "0").strip()
         user_raw = os.getenv("DISCORD_USER_ID", "0").strip()
         guild_raw = os.getenv("DISCORD_GUILD_ID", "").strip()
+        extra_raw = os.getenv("DISCORD_EXTRA_NOTIFY_USER_IDS", "942902769319292948").strip()
+        extra_ids = tuple(u.strip() for u in extra_raw.split(",") if u.strip().isdigit())
 
         if not token:
             raise ValueError("DISCORD_BOT_TOKEN is required in .env")
@@ -49,4 +52,5 @@ class Config:
             prefer_click_and_collect=os.getenv("PREFER_CLICK_AND_COLLECT", "false").lower() == "true",
             keepa_api_key=os.getenv("KEEPA_API_KEY", "").strip() or None,
             brickset_api_key=os.getenv("BRICKSET_API_KEY", "").strip() or None,
+            extra_notify_user_ids=extra_ids,
         )
