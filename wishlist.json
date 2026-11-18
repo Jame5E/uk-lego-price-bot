@@ -1,20 +1,10 @@
 [
   {
     "name": "LEGO Icons The Lord of the Rings: Rivendell",
-    "set_number": "10316",
-    "rrp_gbp": 429.99,
-    "target_price_gbp": 345.00,
-    "min_discount_pct": 15.0,
-    "url": "https://www.amazon.co.uk/dp/B0BV7M5R6Q",
-    "is_retiring": false
+    "set_number": "10316"
   },
   {
     "name": "LEGO Star Wars Millennium Falcon",
-    "set_number": "75192",
-    "rrp_gbp": 734.99,
-    "target_price_gbp": 550.00,
-    "min_discount_pct": 20.0,
-    "url": "https://www.argos.co.uk/product/1234567",
-    "is_retiring": false
+    "set_number": "75192"
   }
 ]
