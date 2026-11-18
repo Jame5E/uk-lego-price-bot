@@ -68,35 +68,57 @@ async def lookup_set_metadata(
 
     # Try Brickset public page first (has Theme/Category, Subtheme, RRP £, and Name)
     public_meta = await _lookup_brickset_public(session, clean_num)
-    if public_meta.name or public_meta.rrp_gbp:
-        return public_meta
 
     lego_url = f"https://www.lego.com/en-gb/product/{clean_num}"
-    try:
-        async with session.get(
-            lego_url, headers=DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=12)
-        ) as resp:
-            if resp.status == 200:
-                html = await resp.text()
-                soup = BeautifulSoup(html, "html.parser")
-                quote = parse_price_from_html(html, lego_url)
-                retiring = "retiring soon" in html.lower()
-
-                og_title = soup.find("meta", attrs={"property": "og:title"})
-                og_image = soup.find("meta", attrs={"property": "og:image"})
-                name = og_title["content"].split("|")[0].strip() if og_title and og_title.get("content") else None
-                image_url = og_image["content"].strip() if og_image and og_image.get("content") else default_box_art_url(clean_num)
-
-                if quote is not None or name is not None:
-                    return SetMetadata(
-                        name=name,
-                        rrp_gbp=quote.price_gbp if quote else None,
-                        is_retiring=retiring,
-                        image_url=image_url,
-                        source="lego_uk",
+    lego_meta: SetMetadata | None = None
+    if not public_meta.name or not public_meta.rrp_gbp or not public_meta.is_retiring:
+        try:
+            async with session.get(
+                lego_url, headers=DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=6)
+            ) as resp:
+                if resp.status == 200:
+                    html = await resp.text()
+                    soup = BeautifulSoup(html, "html.parser")
+                    quote = parse_price_from_html(html, lego_url)
+                    badge_text = " ".join(
+                        el.get_text(" ", strip=True).lower()
+                        for el in soup.find_all(["span", "div"], attrs={"data-test": re.compile("flag|badge|status", re.I)})
                     )
-    except Exception:
-        pass
+                    lower_html = html.lower()
+                    retiring = (
+                        "retiring soon" in badge_text
+                        or '"retiringsoon":true' in lower_html
+                        or '"availabilitytext":"retiring soon"' in lower_html
+                    )
+
+                    og_title = soup.find("meta", attrs={"property": "og:title"})
+                    og_image = soup.find("meta", attrs={"property": "og:image"})
+                    name = og_title["content"].split("|")[0].strip() if og_title and og_title.get("content") else None
+                    image_url = og_image["content"].strip() if og_image and og_image.get("content") else default_box_art_url(clean_num)
+
+                    if quote is not None or name is not None or retiring:
+                        lego_meta = SetMetadata(
+                            name=name,
+                            rrp_gbp=quote.price_gbp if quote else None,
+                            is_retiring=retiring,
+                            image_url=image_url,
+                            source="lego_uk",
+                        )
+        except Exception:
+            pass
+
+    if public_meta.name or public_meta.rrp_gbp:
+        return SetMetadata(
+            name=public_meta.name or (lego_meta.name if lego_meta else None),
+            rrp_gbp=public_meta.rrp_gbp or (lego_meta.rrp_gbp if lego_meta else None),
+            is_retiring=public_meta.is_retiring or (lego_meta.is_retiring if lego_meta else False),
+            image_url=public_meta.image_url or (lego_meta.image_url if lego_meta else default_box_art_url(clean_num)),
+            source=public_meta.source,
+            category=public_meta.category,
+        )
+
+    if lego_meta and (lego_meta.name or lego_meta.rrp_gbp is not None):
+        return lego_meta
 
     return SetMetadata(
         name=None,
@@ -120,6 +142,21 @@ def _enrich_name_with_subtheme(name: str | None, subtheme: str | None) -> str | 
     if subtheme and subtheme.strip() and subtheme.strip().lower() not in name.lower():
         return f"{subtheme.strip()}: {name}"
     return name
+
+
+def _parse_exit_date_retiring(exit_date_text: str) -> bool:
+    """Return True if a Brickset exit date string is within 180 days (or already passed)."""
+    raw = exit_date_text.strip()
+    if not raw:
+        return False
+    for fmt in ("%d %b %Y", "%d %B %Y", "%b %Y", "%B %Y", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+            days_left = (dt - datetime.now(timezone.utc)).days
+            return days_left <= 180
+        except ValueError:
+            continue
+    return False
 
 
 async def _lookup_brickset_public(
@@ -148,6 +185,7 @@ async def _lookup_brickset_public(
     theme: str | None = None
     subtheme: str | None = None
     availability_val: str = ""
+    exit_date_retiring = False
     for dt in soup.find_all("dt"):
         label = dt.get_text(" ", strip=True).lower()
         dd = dt.find_next_sibling("dd")
@@ -158,8 +196,12 @@ async def _lookup_brickset_public(
             theme = val
         elif label == "subtheme":
             subtheme = val
-        elif label in ("availability", "notes", "exit date"):
+        elif label in ("availability", "notes"):
             availability_val += " " + val.lower()
+        elif label == "exit date":
+            availability_val += " " + val.lower()
+            if _parse_exit_date_retiring(val):
+                exit_date_retiring = True
 
     name = _enrich_name_with_subtheme(name, subtheme)
     category = _format_category(theme)
@@ -172,7 +214,7 @@ async def _lookup_brickset_public(
     if m:
         rrp_gbp = round(float(m.group(1)), 2)
 
-    retiring = "retiring soon" in availability_val
+    retiring = exit_date_retiring or ("retiring soon" in availability_val)
     return SetMetadata(
         name=name,
         rrp_gbp=rrp_gbp,
