@@ -28,8 +28,12 @@ logger = logging.getLogger("lego_bot")
 COMMAND_TIMEOUT_SECONDS = 45.0
 
 
-def format_pings(default_user_id: int, item: TrackedItem) -> str:
-    ids = list(item.notify_user_ids) if item.notify_user_ids else [str(default_user_id)]
+def format_pings(
+    default_user_id: int,
+    item: TrackedItem,
+    extra_user_ids: tuple[str, ...] = ("942902769319292948",),
+) -> str:
+    ids = [str(default_user_id), *extra_user_ids, *item.notify_user_ids]
     return " ".join(f"<@{uid}>" for uid in dict.fromkeys(ids))
 
 
@@ -444,7 +448,9 @@ class LegoTrackerBot(discord.Client):
                 )
                 resolved_name = name or meta.name or f"LEGO Set #{clean_num}"
                 rrp = meta.rrp_gbp or 0.0
-                notify_ids = [str(interaction.user.id)]
+                notify_ids = list(
+                    dict.fromkeys([str(self.config.user_id), *self.config.extra_notify_user_ids, str(interaction.user.id)])
+                )
                 box_art = meta.image_url or default_box_art_url(clean_num)
 
                 item = self.db.add_item(
@@ -480,7 +486,7 @@ class LegoTrackerBot(discord.Client):
                         f"{cat_line}"
                         f"💷 **Normal RRP:** {rrp_msg}\n"
                         f"⚠️ **Retiring Soon:** {'Yes' if meta.is_retiring else 'No'}\n"
-                        f"🔔 **Notify:** <@{interaction.user.id}>"
+                        f"🔔 **Notify:** {format_pings(self.config.user_id, item, self.config.extra_notify_user_ids)}"
                     ),
                     color=discord.Color.green(),
                     image_url=box_art,
