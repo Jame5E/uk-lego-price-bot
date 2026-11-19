@@ -711,6 +711,23 @@ class LegoTrackerBot(discord.Client):
                 if len(items) > 1 and idx > 0:
                     await asyncio.sleep(random.uniform(1.5, 3.0))
 
+                status_msg: Optional[discord.Message] = None
+                if scheduled and isinstance(channel, discord.abc.Messageable):
+                    try:
+                        status_msg = await channel.send(
+                            content=f"🔍 **Scheduled Check:** Checking **{format_item_title(item)}** for UK deals...",
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    except Exception:
+                        status_msg = None
+
+                async def _update_status(text: str) -> None:
+                    if status_msg is not None:
+                        try:
+                            await status_msg.edit(content=text, allowed_mentions=discord.AllowedMentions.none())
+                        except Exception:
+                            pass
+
                 rrp = item.rrp_gbp
                 is_retiring = item.is_retiring
                 image_url = item.image_url
@@ -896,6 +913,7 @@ class LegoTrackerBot(discord.Client):
                         ),
                         item.set_number,
                     )
+                    await _update_status(f"ℹ️ **{title}** had no good deals *(no in-stock UK offers found)*.")
                     return
 
                 if rrp <= 0:
@@ -957,9 +975,14 @@ class LegoTrackerBot(discord.Client):
                 if not (hit_target or hit_discount):
                     if item.last_alert_price_gbp is not None:
                         self.db.reset_alert_state(item.id)
+                    await _update_status(
+                        f"ℹ️ **{title}** had no good deals "
+                        f"*(best: £{analysis.total_gbp:.2f} at {best_offer.retailer.display_name}, {analysis.discount_pct:.1f}% off)*."
+                    )
                 elif self.db.should_alert(
                     item, analysis.total_gbp, self.config.alert_cooldown_hours
                 ):
+                    await _update_status(f"🔥 Good deal spotted for **{title}**!")
                     series = list(reversed([h.total_gbp for h in self.db.get_price_history(item.id, limit=30)]))
                     chart_bytes = generate_price_chart(series, rrp) if len(series) >= 2 else None
                     embeds = build_alert_embeds(
@@ -991,6 +1014,11 @@ class LegoTrackerBot(discord.Client):
                         else:
                             await channel.send(content=alert_content, embeds=embeds, allowed_mentions=allowed)
                         self.db.mark_alerted(item.id, analysis.total_gbp)
+                else:
+                    await _update_status(
+                        f"ℹ️ **{title}** is still on deal (**£{analysis.total_gbp:.2f}** at "
+                        f"{best_offer.retailer.display_name} — alert cooldown active)."
+                    )
 
         await asyncio.gather(*(_check_one(idx, it) for idx, it in enumerate(items)))
 
