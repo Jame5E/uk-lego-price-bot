@@ -528,6 +528,7 @@ def test_serpapi_not_called_when_direct_offer_exists_or_not_blocked():
     assert serp_mock.await_count == 0
 
     # Case 2: No offers found, and no blocks (all stores returned 200 not listed) -> do NOT spend SerpApi
+    clear_price_cache()  # Case 1's offer is cached for 30 minutes; start fresh
     async def fake_direct_no_offers_no_block(session, **kwargs):
         return [], f"{kwargs.get('label')}: not in stock / not listed"
 
