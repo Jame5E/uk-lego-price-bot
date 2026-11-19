@@ -406,16 +406,34 @@ async def _fetch_brickwatch_uk(
 
     clean_num = set_number.strip().split("-")[0]
     url = f"https://www.brickwatch.net/en-GB/set/{clean_num}/"
-    try:
-        async with session.get(url, headers=DEFAULT_HEADERS, proxy=proxy_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            if resp.status != 200:
-                if resp.status in (202, 403, 429, 503):
-                    _record_source_block("brickwatch_uk")
-                return [], f"BrickWatch UK: HTTP {resp.status}"
-            html = await resp.text()
-    except Exception as exc:
+    html: str | None = None
+    last_err: str = "BrickWatch UK: unknown error"
+    attempts: list[tuple[str | None, int]] = [(None, 10)]
+    if proxy_url:
+        attempts.append((proxy_url, 20))
+    else:
+        attempts.append((None, 15))
+
+    for attempt_proxy, attempt_timeout in attempts:
+        try:
+            async with session.get(
+                url,
+                headers=DEFAULT_HEADERS,
+                proxy=attempt_proxy,
+                timeout=aiohttp.ClientTimeout(total=attempt_timeout),
+            ) as resp:
+                if resp.status == 200:
+                    html = await resp.text()
+                    break
+                last_err = f"BrickWatch UK: HTTP {resp.status}"
+                if resp.status not in (202, 403, 429, 503):
+                    return [], last_err
+        except Exception as exc:
+            last_err = f"BrickWatch UK: {type(exc).__name__}"
+
+    if html is None:
         _record_source_block("brickwatch_uk")
-        return [], f"BrickWatch UK: {type(exc).__name__}"
+        return [], last_err
 
     _record_source_ok("brickwatch_uk")
     if "£" not in html:
