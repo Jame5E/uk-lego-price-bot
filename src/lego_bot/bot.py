@@ -856,6 +856,16 @@ class LegoTrackerBot(discord.Client):
                 cat_part = f"📂 **Category:** {item.category}\n" if item.category else ""
                 retiring_line = "⚠️ **Status:** Retiring Soon\n" if is_retiring else ""
                 cat_line = f"{cat_part}{retiring_line}"
+                blocked_notes = [
+                    n for n in notes
+                    if any(tok in n.lower() for tok in ("rate-limited", "cooldown", "http ", "timeout", "error"))
+                ]
+                set_tag = f"#{item.set_number}" if item.set_number else title
+                excluded_line = (
+                    f"\n\n⚠️ **Excluded from {set_tag} check:** {', '.join(blocked_notes)} *(not included in results)*"
+                    if blocked_notes
+                    else ""
+                )
 
                 if best_offer is None:
                     # During 0-token interactive checks, fall back to latest verified UK retailer price if recorded
@@ -908,7 +918,7 @@ class LegoTrackerBot(discord.Client):
                                     f"⚠️ *Live stores were unavailable — this saved price may not be up-to-date. Click **Re-check** to try again.*\n"
                                     f"### Normal RRP: £{cached_analysis.rrp_gbp:.2f}  •  **{cached_analysis.discount_pct:.1f}% OFF**\n"
                                     f"📍 **Seller:** {rec_retailer.display_name} *(recorded `{latest.recorded_at[:10]}`)*\n"
-                                    f"{verdict_line}"
+                                    f"{verdict_line}{excluded_line}"
                                 ),
                                 color=discord.Color.blue(),
                                 image_url=box_art,
@@ -982,7 +992,7 @@ class LegoTrackerBot(discord.Client):
                             f"{ship_line}"
                             f"### Normal RRP: £{analysis.rrp_gbp:.2f}  •  **{analysis.discount_pct:.1f}% OFF**\n"
                             f"📍 **Seller:** {best_offer.retailer.display_name}\n"
-                            f"{icon} **{analysis.verdict}** — [View Deal →]({best_offer.url})"
+                            f"{icon} **{analysis.verdict}** — [View Deal →]({best_offer.url}){excluded_line}"
                         ),
                         color=color,
                         image_url=box_art,
