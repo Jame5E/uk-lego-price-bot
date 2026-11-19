@@ -362,6 +362,38 @@ def test_tiered_cooldowns_and_profile_rotation_and_dp_cache():
     assert _uk_mod.clear_cooldowns() == []
 
 
+def test_extended_cooldown_tiers_and_persistence_round_trip():
+    _uk_mod.clear_cooldowns()
+    _uk_mod._SOURCE_COOLDOWN_TIER.clear()
+
+    def _three_blocks() -> float:
+        _SOURCE_COOLDOWN_UNTIL.pop("john_lewis", None)
+        for _ in range(3):
+            _record_source_block("john_lewis")
+        return _SOURCE_COOLDOWN_UNTIL["john_lewis"] - time.monotonic()
+
+    assert 170 <= _three_blocks() <= 185      # 3 min
+    assert 590 <= _three_blocks() <= 605      # 10 min
+    assert 3590 <= _three_blocks() <= 3605    # 1 hour
+    assert 21590 <= _three_blocks() <= 21605  # 6 hours
+    assert 21590 <= _three_blocks() <= 21605  # stays capped at 6 hours
+
+    saved = _uk_mod.export_cooldown_state()
+    assert "john_lewis" in saved and "until_epoch" in saved["john_lewis"]
+
+    # Simulate a restart: wipe in-memory state, then restore from the saved snapshot
+    _uk_mod.clear_cooldowns()
+    _uk_mod.import_cooldown_state(saved)
+    assert 21500 <= _SOURCE_COOLDOWN_UNTIL["john_lewis"] - time.monotonic() <= 21605
+    assert _uk_mod._SOURCE_COOLDOWN_TIER["john_lewis"] == 5
+
+    # Expired cooldowns are dropped on import
+    _uk_mod.clear_cooldowns()
+    _uk_mod.import_cooldown_state({"argos": {"tier": 1, "until_epoch": time.time() - 60}})
+    assert "argos" not in _SOURCE_COOLDOWN_UNTIL
+    _uk_mod.clear_cooldowns()
+
+
 def test_fetch_direct_retries_once_on_503_and_recovers():
     from unittest.mock import AsyncMock, patch
 

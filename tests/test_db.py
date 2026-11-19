@@ -101,6 +101,40 @@ def test_items_due_for_check_prioritizes_unchecked_and_retiring():
     db.close()
 
 
+def test_no_offer_set_rotates_by_last_checked_not_last_price():
+    db = PriceDatabase(":memory:")
+    now = datetime.now(timezone.utc)
+    a = db.add_item(name="Set A", rrp_gbp=99.99, set_number="20001")
+    b = db.add_item(name="Set B", rrp_gbp=99.99, set_number="20002")
+
+    # A was checked 5h ago but found NO offer (no price recorded); B was checked 10h ago with a price
+    db.mark_checked(a.id, now=now - timedelta(hours=5))
+    db._conn.execute(
+        "INSERT INTO price_history (item_id, price_gbp, shipping_gbp, total_gbp, retailer, recorded_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (b.id, 89.99, 0.0, 89.99, "amazon_uk", (now - timedelta(hours=10)).isoformat()),
+    )
+    db._conn.commit()
+
+    # B has gone longest without a check, so it goes first (A no longer stuck at the front)
+    due = db.get_items_due_for_check(min_age_hours=4.0, now=now)
+    assert [i.set_number for i in due] == ["20002", "20001"]
+
+    # Checking A again (still no offer) means it is no longer due at all
+    db.mark_checked(a.id, now=now)
+    due = db.get_items_due_for_check(min_age_hours=4.0, now=now)
+    assert [i.set_number for i in due] == ["20002"]
+    db.close()
+
+
+def test_state_json_round_trip():
+    db = PriceDatabase(":memory:")
+    assert db.get_state_json("missing", {"x": 1}) == {"x": 1}
+    db.set_state_json("status_message", {"message_id": 123, "channel_id": 456})
+    assert db.get_state_json("status_message") == {"message_id": 123, "channel_id": 456}
+    db.close()
+
+
 def test_prune_old_history():
     db = PriceDatabase(":memory:")
     item = db.add_item(name="Test Set", rrp_gbp=100.00, set_number="12345")

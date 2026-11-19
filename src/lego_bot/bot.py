@@ -27,9 +27,11 @@ from .uk_finder import (
     clear_cooldowns,
     clear_price_cache,
     default_box_art_url,
+    export_cooldown_state,
     find_best_uk_offer,
     get_price_cache_stats,
     get_source_health,
+    import_cooldown_state,
     load_amazon_dp_urls,
     lookup_set_metadata,
     pop_finished_cooldowns,
@@ -536,6 +538,7 @@ class LegoTrackerBot(discord.Client):
 
     async def setup_hook(self) -> None:
         self._startup_sync_and_clean()
+        import_cooldown_state(self.db.get_state_json("source_cooldowns", {}))
         connector = aiohttp.TCPConnector(limit=16, ttl_dns_cache=300)
         self.http_session = aiohttp.ClientSession(connector=connector)
         self._register_commands()
@@ -554,6 +557,48 @@ class LegoTrackerBot(discord.Client):
         if not self.cooldown_watcher_loop.is_running():
             self.cooldown_watcher_loop.start()
 
+    def _save_cooldowns(self) -> None:
+        """Persist store cooldowns to SQLite so they survive /bot update restarts."""
+        try:
+            self.db.set_state_json("source_cooldowns", export_cooldown_state())
+        except Exception as exc:
+            logger.warning("Could not save store cooldowns: %s", exc)
+
+    def _format_status_text(self, text: str) -> str:
+        now_ts = int(time.time())
+        next_ts = now_ts + self.config.check_interval_minutes * 60
+        return (
+            f"📌 **Scheduled Check Status**\n"
+            f"{text}\n"
+            f"🕒 Updated <t:{now_ts}:R> • Next check ~<t:{next_ts}:R>"
+        )
+
+    async def _get_status_message(self, channel: discord.abc.Messageable) -> Optional[discord.Message]:
+        """Return the single pinned status message, creating (and pinning) it if it doesn't exist yet."""
+        saved = self.db.get_state_json("status_message", {}) or {}
+        msg_id = saved.get("message_id") if isinstance(saved, dict) else None
+        channel_id = getattr(channel, "id", None)
+        if msg_id and saved.get("channel_id") == channel_id:
+            try:
+                return await channel.fetch_message(int(msg_id))
+            except Exception:
+                pass  # Deleted or inaccessible — create a fresh one below
+        try:
+            msg = await channel.send(
+                content=self._format_status_text("⏳ Waiting for the first scheduled check..."),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except Exception as exc:
+            logger.warning("Could not create status message: %s", exc)
+            return None
+        try:
+            await msg.pin(reason="LEGO bot scheduled check status")
+        except Exception as exc:
+            # Needs the 'Manage Messages' permission; the message still gets edited in place without it
+            logger.info("Could not pin status message (grant 'Manage Messages' to enable): %s", exc)
+        self.db.set_state_json("status_message", {"message_id": msg.id, "channel_id": channel_id})
+        return msg
+
     async def close(self) -> None:
         if self.price_check_loop.is_running():
             self.price_check_loop.cancel()
@@ -564,6 +609,7 @@ class LegoTrackerBot(discord.Client):
         from .uk_finder import close_http_sessions
 
         await close_http_sessions()
+        self._save_cooldowns()
         self.db.close()
         await super().close()
 
@@ -714,21 +760,21 @@ class LegoTrackerBot(discord.Client):
                     await asyncio.sleep(random.uniform(1.5, 3.0))
 
                 status_msg: Optional[discord.Message] = None
+                item_title = format_item_title(item)
                 if scheduled and isinstance(channel, discord.abc.Messageable):
-                    try:
-                        status_msg = await channel.send(
-                            content=f"🔍 **Scheduled Check:** Checking **{format_item_title(item)}** for UK deals...",
-                            allowed_mentions=discord.AllowedMentions.none(),
-                        )
-                    except Exception:
-                        status_msg = None
+                    status_msg = await self._get_status_message(channel)
 
                 async def _update_status(text: str) -> None:
                     if status_msg is not None:
                         try:
-                            await status_msg.edit(content=text, allowed_mentions=discord.AllowedMentions.none())
+                            await status_msg.edit(
+                                content=self._format_status_text(text),
+                                allowed_mentions=discord.AllowedMentions.none(),
+                            )
                         except Exception:
                             pass
+
+                await _update_status(f"🔍 Checking **{item_title}** for UK deals...")
 
                 rrp = item.rrp_gbp
                 is_retiring = item.is_retiring
@@ -788,6 +834,7 @@ class LegoTrackerBot(discord.Client):
                                 allowed_mentions=allowed,
                             )
                         await _emit(retired_embed)
+                        await _update_status(f"📦 **{title}** has retired and was removed from your wishlist.")
                         return
 
                     if meta.name and (resolved_name.startswith("LEGO Set #") or len(meta.name) >= len(resolved_name) - 4):
@@ -851,6 +898,8 @@ class LegoTrackerBot(discord.Client):
                     proxy_url=self.config.proxy_url,
                     force_refresh=force_refresh,
                 )
+
+                self.db.mark_checked(item.id)
 
                 title = format_item_title(item)
                 box_art = item.image_url or default_box_art_url(item.set_number)
@@ -1758,6 +1807,7 @@ class LegoTrackerBot(discord.Client):
                 )
                 return
             cleared_stores = clear_cooldowns()
+            self._save_cooldowns()
             msg = (
                 f"Reset active cooldowns for: {', '.join(f'**{s}**' for s in cleared_stores)}."
                 if cleared_stores

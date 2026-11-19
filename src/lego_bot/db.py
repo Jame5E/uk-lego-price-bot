@@ -7,6 +7,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -426,6 +427,27 @@ class PriceDatabase:
         )
         self._conn.commit()
 
+    # --- Generic JSON bot_state helpers ---
+
+    def get_state_json(self, key: str, default: Any = None) -> Any:
+        row = self._conn.execute("SELECT value FROM bot_state WHERE key = ?", (key,)).fetchone()
+        if not row or not row["value"]:
+            return default
+        try:
+            return json.loads(row["value"])
+        except Exception:
+            return default
+
+    def set_state_json(self, key: str, value: Any) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO bot_state (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, json.dumps(value)),
+        )
+        self._conn.commit()
+
     def get_amazon_dp_urls(self) -> dict[str, str]:
         row = self._conn.execute(
             "SELECT value FROM bot_state WHERE key = 'amazon_dp_urls'"
@@ -508,27 +530,43 @@ class PriceDatabase:
         allowed_by_today = max(1, math.ceil((auto_pool / days_in_month) * dt.day))
         return used < allowed_by_today, allowed_by_today
 
+    def mark_checked(self, item_id: int, now: datetime | None = None) -> None:
+        """Record that a live check ran for this item (whether or not an offer was found)."""
+        ts = (now or datetime.now(timezone.utc)).isoformat()
+        self._conn.execute("UPDATE tracked_items SET last_checked_at = ? WHERE id = ?", (ts, item_id))
+        self._conn.commit()
+
+    def get_last_checked_at(self, item_id: int) -> datetime | None:
+        """Return when this item was last checked (falls back to its latest recorded price for older DBs)."""
+        row = self._conn.execute("SELECT last_checked_at FROM tracked_items WHERE id = ?", (item_id,)).fetchone()
+        raw = row["last_checked_at"] if row else None
+        if not raw:
+            latest = self.get_latest_price(item_id)
+            raw = latest.recorded_at if latest else None
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
     def get_items_due_for_check(
         self,
         *,
         min_age_hours: float = 4.0,
         now: datetime | None = None,
     ) -> list[TrackedItem]:
-        """Return wishlist items due for a background check, stalest first (retiring prioritized 1.5x)."""
+        """Return wishlist items due for a background check, longest-since-last-checked first
+        (retiring sets prioritized 1.5x). Never-checked sets come first."""
         dt = now or datetime.now(timezone.utc)
         scored: list[tuple[float, TrackedItem]] = []
         for item in self.list_items():
-            latest = self.get_latest_price(item.id)
-            if latest is None:
+            last_checked = self.get_last_checked_at(item.id)
+            if last_checked is None:
                 scored.append((1e9, item))
                 continue
-            try:
-                rec_dt = datetime.fromisoformat(latest.recorded_at)
-                if rec_dt.tzinfo is None:
-                    rec_dt = rec_dt.replace(tzinfo=timezone.utc)
-                age_hours = (dt - rec_dt).total_seconds() / 3600.0
-            except ValueError:
-                age_hours = 999.0
+            age_hours = (dt - last_checked).total_seconds() / 3600.0
 
             effective_min = min_age_hours / 1.5 if item.is_retiring else min_age_hours
             if age_hours >= effective_min:

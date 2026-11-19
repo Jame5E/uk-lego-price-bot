@@ -141,6 +141,40 @@ def clear_cooldowns() -> list[str]:
     return [_SOURCE_DISPLAY_NAMES.get(k, k) for k in active_keys]
 
 
+def export_cooldown_state() -> dict[str, dict[str, float]]:
+    """Serialize active cooldowns + escalation tiers using wall-clock time (for SQLite persistence)."""
+    mono_now = time.monotonic()
+    wall_now = time.time()
+    state: dict[str, dict[str, float]] = {}
+    for key in set(_SOURCE_COOLDOWN_TIER) | set(_SOURCE_COOLDOWN_UNTIL):
+        entry: dict[str, float] = {"tier": float(_SOURCE_COOLDOWN_TIER.get(key, 0))}
+        until = _SOURCE_COOLDOWN_UNTIL.get(key)
+        if until is not None and until > mono_now:
+            entry["until_epoch"] = wall_now + (until - mono_now)
+        state[key] = entry
+    return state
+
+
+def import_cooldown_state(state: dict[str, Any] | None) -> None:
+    """Restore cooldowns saved by export_cooldown_state (expired cooldowns are dropped silently)."""
+    if not isinstance(state, dict):
+        return
+    mono_now = time.monotonic()
+    wall_now = time.time()
+    for key, entry in state.items():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            tier = int(entry.get("tier", 0))
+        except (TypeError, ValueError):
+            tier = 0
+        if tier > 0:
+            _SOURCE_COOLDOWN_TIER[key] = tier
+        until_epoch = entry.get("until_epoch")
+        if isinstance(until_epoch, (int, float)) and until_epoch > wall_now:
+            _SOURCE_COOLDOWN_UNTIL[key] = mono_now + (float(until_epoch) - wall_now)
+
+
 # In-memory price cache (30 minutes) and Amazon /dp/{asin} URL cache
 _PRICE_CACHE_TTL_SECONDS = 1800.0
 _PRICE_CACHE: dict[str, tuple[float, "UKOffer", list[str]]] = {}

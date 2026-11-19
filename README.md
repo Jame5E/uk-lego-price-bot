@@ -22,7 +22,7 @@ A Discord bot that monitors your favourite LEGO sets/pieces in **GBP (£)** acro
 2. Open the **Bot** tab → click **Reset Token** and copy your bot token.
 3. Open **OAuth2 → URL Generator**:
    - Scopes: `bot`, `applications.commands`
-   - Bot Permissions: `Send Messages`, `Embed Links`, `View Channel`
+   - Bot Permissions: `Send Messages`, `Embed Links`, `View Channel`, `Read Message History` (to edit its status message), and optionally `Manage Messages` (to pin it)
 4. Open the generated URL to invite the bot to your Discord server.
 5. In Discord, enable **Developer Mode** (User Settings → Advanced), then right-click your target channel → **Copy Channel ID**, and right-click your username → **Copy User ID**.
 
@@ -39,21 +39,6 @@ source .venv/bin/activate
 pip install -r requirements.txt
 python run.py
 ```
-
-## cPanel + FTP Mode (Twice-Daily Cron Job)
-If you are on standard shared cPanel hosting (FTP without a 24/7 background process):
-1. Upload the project folder via **FTP** (e.g. into `/home/youruser/lego-price-bot`).
-2. Copy `wishlist.example.json` to `wishlist.json` and add the LEGO sets/pieces you want to watch.
-3. In Discord, open your target channel's **Settings → Integrations → Webhooks → New Webhook** and copy the Webhook URL into `DISCORD_WEBHOOK_URL` in `.env` (along with `DISCORD_USER_ID`).
-4. In cPanel **Setup Python App** (or via cPanel Terminal), install `requirements.txt` (`aiohttp`, `beautifulsoup4`, `python-dotenv` are all `cron_check.py` needs).
-5. Test it once with:
-   ```bash
-   python cron_check.py --test
-   ```
-6. In cPanel **Cron Jobs**, add a **Twice Per Day** cron job (e.g., `0 9,18 * * *` for 9:00 AM and 6:00 PM):
-   ```bash
-   cd /home/youruser/lego-price-bot && /path/to/venv/bin/python cron_check.py >> cron.log 2>&1
-   ```
 
 ## Free Hosting Options (24/7)
 1. **Oracle Cloud Always Free Tier** (London `uk-london-1` region available): Gives you a free always-on Linux VM (requires card verification, £0/month).
