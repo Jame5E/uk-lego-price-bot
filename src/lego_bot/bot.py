@@ -903,6 +903,7 @@ class LegoTrackerBot(discord.Client):
                                 (
                                     f"{cat_line}"
                                     f"## 🏷️ Last Verified Price: £{cached_analysis.total_gbp:.2f}\n"
+                                    f"⚠️ *Live stores were unavailable — this saved price may not be up-to-date. Click **Re-check** to try again.*\n"
                                     f"### Normal RRP: £{cached_analysis.rrp_gbp:.2f}  •  **{cached_analysis.discount_pct:.1f}% OFF**\n"
                                     f"📍 **Seller:** {rec_retailer.display_name} *(recorded `{latest.recorded_at[:10]}`)*\n"
                                     f"{verdict_line}"
