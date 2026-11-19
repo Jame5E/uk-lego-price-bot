@@ -5,7 +5,9 @@ from src.lego_bot import bot as _bot_mod  # noqa: F401
 from src.lego_bot.deal_filter import is_valid_lego_set_listing
 from src.lego_bot.shipping import APPROVED_UK_RETAILERS, UKRetailer
 from src.lego_bot.uk_finder import (
+    _COOLDOWN_EXPIRY_PENDING,
     _PRICE_CACHE,
+    _SOURCE_COOLDOWN_UNTIL,
     _SOURCE_FIRST_FAIL_AT,
     _SOURCE_OUTAGE_ALERTED,
     UKOffer,
@@ -14,6 +16,7 @@ from src.lego_bot.uk_finder import (
     build_lego_uk_product_url,
     build_uk_search_urls,
     clean_set_display_name,
+    clear_price_cache,
     extract_first_gbp_price_from_search,
     find_best_uk_offer,
     get_price_cache_stats,
@@ -23,6 +26,7 @@ from src.lego_bot.uk_finder import (
     parse_argos_search_html,
     parse_john_lewis_search_html,
     parse_serpapi_shopping_payload,
+    pop_finished_cooldowns,
     pop_long_outage_sources,
 )
 
@@ -265,3 +269,45 @@ def test_long_outage_alert_fires_once_and_resets():
 
     _SOURCE_FIRST_FAIL_AT.clear()
     _SOURCE_OUTAGE_ALERTED.clear()
+
+
+def test_clear_price_cache_and_amazon_multi_h2_and_cooldown_expiry():
+    _PRICE_CACHE.clear()
+    _PRICE_CACHE["42171|1|0|"] = (
+        time.monotonic(),
+        UKOffer(
+            retailer=UKRetailer.JOHN_LEWIS,
+            url="https://www.johnlewis.com/p1",
+            item_price_gbp=170.99,
+            shipping_gbp=0.0,
+            total_gbp=170.99,
+            shipping_note="Free",
+        ),
+        [],
+    )
+    assert clear_price_cache() == 1
+    assert clear_price_cache() == 0
+
+    # Amazon UK card with brand-only first <h2>LEGO</h2> and title in second <h2>
+    amz_multi_h2 = """
+    <html><body>
+      <span id="glow-ingress-line2">United Kingdom</span>
+      <div data-component-type="s-search-result" data-asin="B0CFVZ74KT">
+        <h2>LEGO</h2>
+        <h2>Technic Mercedes-AMG F1 W14 E Performance 42171</h2>
+        <span class="a-price"><span class="a-offscreen">£138.98</span></span>
+      </div>
+    </body></html>
+    """
+    offers = parse_amazon_uk_search_html(amz_multi_h2, "42171", rrp_gbp=189.99, has_amazon_prime=True)
+    assert len(offers) == 1
+    assert offers[0].item_price_gbp == 138.98
+
+    # Cooldown expiry notification fires once with display name
+    _SOURCE_COOLDOWN_UNTIL.clear()
+    _COOLDOWN_EXPIRY_PENDING.clear()
+    _SOURCE_COOLDOWN_UNTIL["argos"] = time.monotonic() - 1.0
+    assert pop_finished_cooldowns() == ["Argos"]
+    assert pop_finished_cooldowns() == []
+    _SOURCE_COOLDOWN_UNTIL.clear()
+    _COOLDOWN_EXPIRY_PENDING.clear()

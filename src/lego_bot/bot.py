@@ -22,11 +22,13 @@ from .shipping import APPROVED_UK_RETAILERS, UKRetailer, detect_retailer_from_ur
 from .uk_finder import (
     HAS_CURL_CFFI,
     clean_set_display_name,
+    clear_price_cache,
     default_box_art_url,
     find_best_uk_offer,
     get_price_cache_stats,
     get_source_health,
     lookup_set_metadata,
+    pop_finished_cooldowns,
     pop_long_outage_sources,
 )
 from .wishlist_store import load_wishlist_entries, remove_wishlist_entry, upsert_wishlist_entry
@@ -544,10 +546,14 @@ class LegoTrackerBot(discord.Client):
 
         self.price_check_loop.change_interval(minutes=self.config.check_interval_minutes)
         self.price_check_loop.start()
+        if not self.cooldown_watcher_loop.is_running():
+            self.cooldown_watcher_loop.start()
 
     async def close(self) -> None:
         if self.price_check_loop.is_running():
             self.price_check_loop.cancel()
+        if self.cooldown_watcher_loop.is_running():
+            self.cooldown_watcher_loop.cancel()
         if self.http_session and not self.http_session.closed:
             await self.http_session.close()
         from .uk_finder import close_http_sessions
@@ -558,6 +564,28 @@ class LegoTrackerBot(discord.Client):
 
     async def on_ready(self) -> None:
         logger.info("Logged in as %s (ID: %s)", self.user, self.user.id if self.user else "?")
+
+    @tasks.loop(minutes=1)
+    async def cooldown_watcher_loop(self) -> None:
+        finished = pop_finished_cooldowns()
+        if not finished:
+            return
+        channel = self.get_channel(self.config.channel_id)
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(self.config.channel_id)
+            except Exception:
+                channel = None
+        if isinstance(channel, discord.abc.Messageable):
+            stores = ", ".join(f"**{s}**" for s in finished)
+            noun = "this store" if len(finished) == 1 else "these stores"
+            content = f"@everyone ✅ Cooldown has finished for {stores} — checks for {noun} have resumed."
+            allowed = discord.AllowedMentions.none() if self.dev_mode else discord.AllowedMentions(everyone=True)
+            await channel.send(content=content, allowed_mentions=allowed)
+
+    @cooldown_watcher_loop.before_loop
+    async def before_cooldown_watcher_loop(self) -> None:
+        await self.wait_until_ready()
 
     @tasks.loop(minutes=30)
     async def price_check_loop(self) -> None:
@@ -896,12 +924,18 @@ class LegoTrackerBot(discord.Client):
 
                 icon = "🟢" if "BUY NOW" in analysis.verdict else ("🟡" if "GOOD" in analysis.verdict or "SOON" in analysis.verdict else "🟠")
                 color = discord.Color.green() if "BUY NOW" in analysis.verdict else (discord.Color.gold() if "GOOD" in analysis.verdict or "SOON" in analysis.verdict else discord.Color.blue())
+                ship_line = (
+                    f"*(£{best_offer.item_price_gbp:.2f} item + £{best_offer.shipping_gbp:.2f} {best_offer.shipping_note})*\n"
+                    if best_offer.shipping_gbp > 0
+                    else ""
+                )
                 await _emit(
                     make_status_embed(
                         f"🧩 {title}",
                         (
                             f"{cat_line}"
                             f"## 🏷️ Deal Price: £{analysis.total_gbp:.2f}\n"
+                            f"{ship_line}"
                             f"### Normal RRP: £{analysis.rrp_gbp:.2f}  •  **{analysis.discount_pct:.1f}% OFF**\n"
                             f"📍 **Seller:** {best_offer.retailer.display_name}\n"
                             f"{icon} **{analysis.verdict}** — [View Deal →]({best_offer.url})"
@@ -1630,6 +1664,22 @@ class LegoTrackerBot(discord.Client):
                     f"• **Pruned rows older than 180 days:** {pruned_old}\n"
                     f"• **Reset poisoned alert states:** {reset_items}"
                 ),
+                color=discord.Color.green(),
+            )
+            await interaction.response.send_message(embed=embed)
+
+        @bot_group.command(name="clear_cache", description="Clear the 30-minute in-memory price cache (Admin only)")
+        async def bot_clear_cache(interaction: discord.Interaction) -> None:
+            if not is_admin_user(interaction, self.config.user_id):
+                await interaction.response.send_message(
+                    embed=make_error_embed("Admin Only", "Only server admins can use `/bot` commands."),
+                    ephemeral=True,
+                )
+                return
+            cleared = clear_price_cache()
+            embed = make_status_embed(
+                "🧹 Price Cache Cleared",
+                f"Removed **{cleared}** cached set(s) from the 30-minute memory cache.",
                 color=discord.Color.green(),
             )
             await interaction.response.send_message(embed=embed)

@@ -55,6 +55,14 @@ _SOURCE_FAIL_STREAK: dict[str, int] = {}
 _SOURCE_COOLDOWN_UNTIL: dict[str, float] = {}
 _SOURCE_FIRST_FAIL_AT: dict[str, float] = {}
 _SOURCE_OUTAGE_ALERTED: set[str] = set()
+_COOLDOWN_EXPIRY_PENDING: set[str] = set()
+
+_SOURCE_DISPLAY_NAMES: dict[str, str] = {
+    "amazon_uk": "Amazon UK",
+    "john_lewis": "John Lewis",
+    "argos": "Argos",
+    "disney_store": "Disney Store UK",
+}
 
 
 def _is_source_cooled_down(source_key: str) -> bool:
@@ -64,6 +72,7 @@ def _is_source_cooled_down(source_key: str) -> bool:
     if source_key in _SOURCE_COOLDOWN_UNTIL:
         _SOURCE_COOLDOWN_UNTIL.pop(source_key, None)
         _SOURCE_FAIL_STREAK.pop(source_key, None)
+        _COOLDOWN_EXPIRY_PENDING.add(source_key)
     return False
 
 
@@ -74,6 +83,7 @@ def _record_source_block(source_key: str) -> None:
     _SOURCE_FAIL_STREAK[source_key] = streak
     if streak >= 2:
         _SOURCE_COOLDOWN_UNTIL[source_key] = now + _SOURCE_COOLDOWN_SECONDS
+        _COOLDOWN_EXPIRY_PENDING.discard(source_key)
 
 
 def _record_source_ok(source_key: str) -> None:
@@ -81,6 +91,7 @@ def _record_source_ok(source_key: str) -> None:
     _SOURCE_COOLDOWN_UNTIL.pop(source_key, None)
     _SOURCE_FIRST_FAIL_AT.pop(source_key, None)
     _SOURCE_OUTAGE_ALERTED.discard(source_key)
+    _COOLDOWN_EXPIRY_PENDING.discard(source_key)
 
 
 def pop_long_outage_sources(min_outage_seconds: float = _SOURCE_OUTAGE_ALERT_SECONDS) -> list[str]:
@@ -92,6 +103,21 @@ def pop_long_outage_sources(min_outage_seconds: float = _SOURCE_OUTAGE_ALERT_SEC
             _SOURCE_OUTAGE_ALERTED.add(key)
             outages.append(key)
     return outages
+
+
+def pop_finished_cooldowns() -> list[str]:
+    """Return human-readable store names whose cooldowns just expired (once per cooldown)."""
+    now = time.monotonic()
+    for key, until in list(_SOURCE_COOLDOWN_UNTIL.items()):
+        if now >= until:
+            _SOURCE_COOLDOWN_UNTIL.pop(key, None)
+            _SOURCE_FAIL_STREAK.pop(key, None)
+            _COOLDOWN_EXPIRY_PENDING.add(key)
+    if not _COOLDOWN_EXPIRY_PENDING:
+        return []
+    finished = sorted(_COOLDOWN_EXPIRY_PENDING)
+    _COOLDOWN_EXPIRY_PENDING.clear()
+    return [_SOURCE_DISPLAY_NAMES.get(k, k) for k in finished]
 
 
 # In-memory price cache (30 minutes) to keep `/wishlist check` instant and save resources
@@ -109,6 +135,7 @@ def get_source_health() -> dict[str, int]:
         else:
             _SOURCE_COOLDOWN_UNTIL.pop(key, None)
             _SOURCE_FAIL_STREAK.pop(key, None)
+            _COOLDOWN_EXPIRY_PENDING.add(key)
     return active
 
 
@@ -119,6 +146,13 @@ def get_price_cache_stats() -> tuple[int, int]:
         if now - ts >= _PRICE_CACHE_TTL_SECONDS:
             _PRICE_CACHE.pop(key, None)
     return len(_PRICE_CACHE), int(_PRICE_CACHE_TTL_SECONDS)
+
+
+def clear_price_cache() -> int:
+    """Clear all cached price entries and return the number of removed entries."""
+    count = len(_PRICE_CACHE)
+    _PRICE_CACHE.clear()
+    return count
 
 
 @dataclass(frozen=True)
@@ -894,7 +928,14 @@ async def _fetch_direct_uk_store(
             if status in (202, 403, 429, 503):
                 _record_source_block(source_key)
             return [], f"{label}: HTTP {status}"
-        if "validateCaptcha" in html:
+        html_lower = html.lower()
+        if (
+            "validatecaptcha" in html_lower
+            or "enter the characters you see below" in html_lower
+            or "api-services-support@amazon" in html_lower
+            or "sorry, we just need to make sure you're not a robot" in html_lower
+            or (source_key == "amazon_uk" and 'data-component-type="s-search-result"' not in html)
+        ):
             _record_source_block(source_key)
             return [], f"{label}: rate-limited"
     except Exception as exc:
