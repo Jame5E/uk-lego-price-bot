@@ -63,6 +63,7 @@ _SOURCE_DISPLAY_NAMES: dict[str, str] = {
     "john_lewis": "John Lewis",
     "argos": "Argos",
     "disney_store": "Disney Store UK",
+    "lego_uk": "LEGO.com UK",
 }
 
 
@@ -334,11 +335,18 @@ async def _http_get_html(
     timeout_seconds: float = 10.0,
 ) -> tuple[int, str]:
     """Fetch HTML using shared Chrome TLS impersonation (curl_cffi) when available, else aiohttp."""
+    uk_headers = {
+        "Accept-Language": "en-GB,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": "https://www.google.co.uk/",
+        "Upgrade-Insecure-Requests": "1",
+    }
     if HAS_CURL_CFFI and CurlAsyncSession is not None:
         csession = _get_curl_session()
         try:
             resp = await csession.get(
                 url,
+                headers=uk_headers,
                 cookies=cookies,
                 timeout=timeout_seconds,
                 allow_redirects=True,
@@ -359,8 +367,7 @@ async def _http_get_html(
         raise RuntimeError("No HTTP session available")
     merged_headers = {
         **DEFAULT_HEADERS,
-        "Accept-Language": "en-GB,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        **uk_headers,
     }
     async with session.get(
         url,
@@ -369,6 +376,46 @@ async def _http_get_html(
         timeout=aiohttp.ClientTimeout(total=timeout_seconds),
     ) as resp:
         return resp.status, await resp.text()
+
+
+def _parse_lego_uk_retiring(html: str) -> bool:
+    """Detect LEGO.com UK 'Retiring soon' badge or JSON availability flag."""
+    if not html:
+        return False
+    lower = html.lower()
+    if '"retiringsoon":true' in lower or '"availabilitystatus":"retiringsoon"' in lower:
+        return True
+    soup = BeautifulSoup(html, "html.parser")
+    for el in soup.find_all(["span", "div", "p", "strong"], limit=1500):
+        txt = el.get_text(" ", strip=True).lower()
+        if txt in ("retiring soon", "retiring soon!"):
+            soup.decompose()
+            return True
+    soup.decompose()
+    return False
+
+
+async def _lookup_lego_uk_retiring(
+    session: aiohttp.ClientSession | None,
+    set_number: str,
+    name_hint: str | None = None,
+) -> bool:
+    """Rate-limit-safe check of LEGO.com UK product page for 'Retiring soon' status."""
+    if _is_source_cooled_down("lego_uk"):
+        return False
+    url = build_lego_uk_product_url(name_hint, set_number)
+    try:
+        status, html = await _http_get_html(session, url, timeout_seconds=10.0)
+        if status in (202, 403, 429, 503):
+            _record_source_block("lego_uk")
+            return False
+        if status != 200:
+            return False
+        _record_source_ok("lego_uk")
+        return _parse_lego_uk_retiring(html)
+    except Exception:
+        _record_source_block("lego_uk")
+        return False
 
 
 async def lookup_set_metadata(
@@ -381,14 +428,30 @@ async def lookup_set_metadata(
     """Auto-discover set name, category, UK RRP (£), box art image, and retiring status."""
     clean_num = set_number.strip().split("-")[0]
 
+    meta: SetMetadata | None = None
     if brickset_api_key:
-        meta = await _lookup_brickset(session, clean_num, brickset_api_key)
-        if meta.rrp_gbp is not None or meta.name is not None:
-            return meta
+        candidate = await _lookup_brickset(session, clean_num, brickset_api_key)
+        if candidate.rrp_gbp is not None or candidate.name is not None:
+            meta = candidate
 
-    public_meta = await _lookup_brickset_public(session, clean_num)
-    if public_meta.name or public_meta.rrp_gbp or public_meta.is_retired:
-        return public_meta
+    if meta is None:
+        public_meta = await _lookup_brickset_public(session, clean_num)
+        if public_meta.name or public_meta.rrp_gbp or public_meta.is_retired:
+            meta = public_meta
+
+    if meta is not None:
+        if not meta.is_retiring and not meta.is_retired:
+            if await _lookup_lego_uk_retiring(session, clean_num, meta.name):
+                meta = SetMetadata(
+                    name=meta.name,
+                    rrp_gbp=meta.rrp_gbp,
+                    is_retiring=True,
+                    image_url=meta.image_url,
+                    source=meta.source,
+                    category=meta.category,
+                    is_retired=meta.is_retired,
+                )
+        return meta
 
     return SetMetadata(
         name=None,
@@ -983,7 +1046,7 @@ async def _fetch_direct_uk_store(
         try:
             status, html = await _http_get_html(session, url, cookies=cookies, timeout_seconds=10.0)
             if status != 200:
-                if status in (429, 503) and attempt == 0:
+                if status in (403, 429, 503) and attempt == 0:
                     _rotate_curl_profile()
                     await asyncio.sleep(2.0)
                     continue
@@ -1323,12 +1386,12 @@ async def find_best_uk_offer(
         if err:
             notes.append(err)
 
-    # SerpApi blocked-only fallback: only spend a credit if direct stores had a block/cooldown or found nothing
+    # SerpApi blocked-only fallback: only spend a credit when NO direct offers were found AND a store was blocked/rate-limited
     any_blocked = any(
         any(tok in n.lower() for tok in ("rate-limited", "cooldown", "http 503", "http 403", "http 429"))
         for n in notes
     )
-    if clean_num and serpapi_key and allow_serpapi and (not offers or any_blocked):
+    if clean_num and serpapi_key and allow_serpapi and (not offers and any_blocked):
         serp_offers, serp_err = await _fetch_serpapi_google_shopping_uk(
             session,
             clean_num,

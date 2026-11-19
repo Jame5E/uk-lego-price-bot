@@ -394,3 +394,124 @@ def test_fetch_direct_retries_once_on_503_and_recovers():
     assert offers[0].item_price_gbp == 138.98
     assert mock_get.await_count == 2
     assert "amazon_uk" not in _uk_mod._SOURCE_FAIL_STREAK
+
+
+def test_fetch_direct_retries_once_on_403_and_recovers():
+    from unittest.mock import AsyncMock, patch
+
+    _uk_mod.clear_cooldowns()
+    argos_html = """
+    <html><body>
+      <div data-test="component-product-card">
+        <a data-test="component-product-card-title" href="/product/1234567">LEGO Technic 42171 Mercedes-AMG F1</a>
+        <div data-test="component-product-card-price"><strong>£149.99</strong></div>
+      </div>
+    </body></html>
+    """
+    mock_get = AsyncMock(side_effect=[(403, "Forbidden"), (200, argos_html)])
+    with patch("src.lego_bot.uk_finder._http_get_html", new=mock_get), patch(
+        "src.lego_bot.uk_finder.asyncio.sleep", new=AsyncMock()
+    ):
+        offers, err = asyncio.run(
+            _uk_mod._fetch_direct_uk_store(
+                None,
+                source_key="argos",
+                label="Argos",
+                url="https://www.argos.co.uk/search/lego-42171/",
+                parser_fn=lambda html: _uk_mod.parse_argos_search_html(html, "42171", rrp_gbp=189.99),
+            )
+        )
+    assert err is None
+    assert len(offers) == 1
+    assert offers[0].item_price_gbp == 149.99
+    assert mock_get.await_count == 2
+    assert "argos" not in _uk_mod._SOURCE_FAIL_STREAK
+
+
+def test_lookup_set_metadata_checks_lego_uk_when_brickset_not_retiring():
+    from unittest.mock import AsyncMock, patch
+
+    _uk_mod.clear_cooldowns()
+    brickset_html = """
+    <html><body>
+      <h1>42171: Mercedes-AMG F1 W14 E Performance</h1>
+      <dl>
+        <dt>Theme</dt><dd>Technic</dd>
+        <dt>Availability</dt><dd>Retail</dd>
+        <dt>RRP</dt><dd>£189.99</dd>
+      </dl>
+    </body></html>
+    """
+    lego_uk_html = """
+    <html><body>
+      <span data-test="product-flag">Retiring soon</span>
+    </body></html>
+    """
+    mock_get = AsyncMock(side_effect=[(200, brickset_html), (200, lego_uk_html)])
+    with patch("src.lego_bot.uk_finder._http_get_html", new=mock_get):
+        meta = asyncio.run(_uk_mod.lookup_set_metadata(None, "42171"))  # type: ignore[arg-type]
+
+    assert meta.is_retiring is True
+    assert meta.rrp_gbp == 189.99
+    assert mock_get.await_count == 2
+
+
+def test_serpapi_not_called_when_direct_offer_exists_or_not_blocked():
+    from unittest.mock import AsyncMock, patch
+    from src.lego_bot.shipping import UKOffer, UKRetailer
+
+    _uk_mod.clear_cooldowns()
+    sample_offer = UKOffer(
+        retailer=UKRetailer.JOHN_LEWIS,
+        url="https://www.johnlewis.com/p1",
+        item_price_gbp=159.99,
+        shipping_gbp=0.0,
+        total_gbp=159.99,
+        shipping_note="Free UK delivery",
+    )
+
+    # Case 1: John Lewis found an offer, Argos 403d -> do NOT spend SerpApi
+    async def fake_direct_with_offer(session, **kwargs):
+        if kwargs.get("source_key") == "john_lewis":
+            return [sample_offer], None
+        if kwargs.get("source_key") == "argos":
+            return [], "Argos: HTTP 403"
+        return [], f"{kwargs.get('label')}: not listed"
+
+    serp_mock = AsyncMock(return_value=([], None))
+    with patch("src.lego_bot.uk_finder._fetch_direct_uk_store", side_effect=fake_direct_with_offer), patch(
+        "src.lego_bot.uk_finder._fetch_serpapi_google_shopping_uk", new=serp_mock
+    ):
+        best, _ = asyncio.run(
+            _uk_mod.find_best_uk_offer(
+                None,  # type: ignore[arg-type]
+                name="Test Set",
+                set_number="42171",
+                rrp_gbp=189.99,
+                serpapi_key="fake-key",
+            )
+        )
+    assert best is not None and best.retailer == UKRetailer.JOHN_LEWIS
+    assert serp_mock.await_count == 0
+
+    # Case 2: No offers found, and no blocks (all stores returned 200 not listed) -> do NOT spend SerpApi
+    async def fake_direct_no_offers_no_block(session, **kwargs):
+        return [], f"{kwargs.get('label')}: not in stock / not listed"
+
+    serp_mock2 = AsyncMock(return_value=([], None))
+    with patch("src.lego_bot.uk_finder._fetch_direct_uk_store", side_effect=fake_direct_no_offers_no_block), patch(
+        "src.lego_bot.uk_finder._fetch_serpapi_google_shopping_uk", new=serp_mock2
+    ):
+        best2, _ = asyncio.run(
+            _uk_mod.find_best_uk_offer(
+                None,  # type: ignore[arg-type]
+                name="Test Set",
+                set_number="42171",
+                rrp_gbp=189.99,
+                serpapi_key="fake-key",
+            )
+        )
+    assert best2 is None
+    assert serp_mock2.await_count == 0
+
+

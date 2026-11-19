@@ -796,7 +796,7 @@ class LegoTrackerBot(discord.Client):
                     if rrp <= 0 and meta.rrp_gbp:
                         rrp = meta.rrp_gbp
                     if meta.source in ("brickset", "brickset_web", "lego_uk"):
-                        is_retiring = meta.is_retiring
+                        is_retiring = is_retiring or meta.is_retiring
                     if not image_url and meta.image_url:
                         image_url = meta.image_url
 
