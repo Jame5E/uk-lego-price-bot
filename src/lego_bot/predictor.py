@@ -43,23 +43,17 @@ def analyze_price(
     below_avg = hist_avg is not None and total_gbp < hist_avg * 0.95
 
     if is_retiring:
-        if discount_pct >= 20.0 or near_all_time_low:
+        if discount_pct > 0.0:
             verdict = "BUY NOW (RETIRING)"
             forecast = (
-                "This set is retiring soon and is at a strong discount. "
-                "Prices are unlikely to drop further and typically rise once UK retail stock sells out."
-            )
-        elif discount_pct >= 10.0:
-            verdict = "BUY SOON (RETIRING)"
-            forecast = (
-                "Modest discount on a retiring set. It might dip slightly in a clearance, "
-                "but waiting risks it selling out and going up on the secondary market."
+                "This set is retiring soon and is below RRP. "
+                "Waiting risks it selling out and jumping in price on the secondary market."
             )
         else:
             verdict = "WATCH (RETIRING)"
             forecast = (
-                "Small or no discount yet, but because it is retiring soon, "
-                "keep an eye out for a quick 15-25% clearance drop before it disappears."
+                "Currently at full RRP, but because it is retiring soon, "
+                "grab it on any dip before UK retail stock sells out."
             )
     else:
         if discount_pct >= 30.0 or (near_all_time_low and discount_pct >= 20.0):

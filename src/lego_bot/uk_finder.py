@@ -250,11 +250,28 @@ def _enrich_name_with_subtheme(name: str | None, subtheme: str | None, set_numbe
 
 
 def _parse_exit_date_status(exit_date_text: str) -> tuple[bool, bool]:
-    """Return (is_retiring, is_retired) from a Brickset exit date string."""
+    """Return (is_retiring, is_retired) from a Brickset exit date or 'Launch - Exit' range string."""
     raw = exit_date_text.strip()
     if not raw:
         return False, False
-    for fmt in ("%d %b %Y", "%d %B %Y", "%b %Y", "%B %Y", "%Y-%m-%d"):
+    # Brickset's "Launch/exit" field is often formatted as "01 Mar 25 - 31 Dec 26"
+    for sep in (" - ", " – ", " to "):
+        if sep in raw:
+            raw = raw.split(sep)[-1].strip()
+            break
+    if not raw or raw.lower() in ("tbd", "tba", "?", "n/a", "unknown"):
+        return False, False
+    for fmt in (
+        "%d %b %Y",
+        "%d %b %y",
+        "%d %B %Y",
+        "%d %B %y",
+        "%b %Y",
+        "%b %y",
+        "%B %Y",
+        "%B %y",
+        "%Y-%m-%d",
+    ):
         try:
             dt = datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
             days_left = (dt - datetime.now(timezone.utc)).days
@@ -725,12 +742,8 @@ def parse_amazon_uk_product_html(
         if not is_valid_lego_set_listing(title, clean_num, price, rrp_gbp):
             return None, True
 
-        merchant_el = soup.find(id="merchantInfoFeature_feature_div") or soup.find(id="tabular-buybox")
-        merchant_text = merchant_el.get_text(" ", strip=True).lower() if merchant_el else ""
-        sold_by_amazon = (not merchant_text) or ("amazon" in merchant_text)
-
         explicit_delivery: str | None = None
-        if not ex_vat_export:
+        if not ex_vat_export and not has_amazon_prime:
             deliv_el = soup.find(id="mir-layout-DELIVERY_BLOCK-slot-PRIMARY_DELIVERY_MESSAGE_LARGE")
             if deliv_el:
                 deliv_text = deliv_el.get_text(" ", strip=True)
@@ -740,10 +753,10 @@ def parse_amazon_uk_product_html(
         ship = estimate_uk_shipping(
             price,
             UKRetailer.AMAZON_UK,
-            has_amazon_prime=has_amazon_prime if sold_by_amazon else False,
+            has_amazon_prime=has_amazon_prime,
             explicit_delivery_text=explicit_delivery,
         )
-        note = ship.note if sold_by_amazon else f"{ship.note} (3rd-party seller)"
+        note = ship.note
         return (
             UKOffer(
                 retailer=UKRetailer.AMAZON_UK,

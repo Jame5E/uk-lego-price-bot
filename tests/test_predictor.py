@@ -30,11 +30,21 @@ def test_mild_discount_wait():
 
 
 def test_retiring_set_verdict():
+    # Any discount below RRP on a retiring set should say BUY NOW (RETIRING)
     analysis = analyze_price(
         rrp_gbp=100.00,
-        item_price_gbp=78.00,
+        item_price_gbp=92.00,
         shipping_gbp=0.00,
-        historical_totals_gbp=[100.0, 90.0],
+        historical_totals_gbp=[100.0, 95.0],
         is_retiring=True,
     )
     assert analysis.verdict == "BUY NOW (RETIRING)"
+
+    full_rrp = analyze_price(
+        rrp_gbp=100.00,
+        item_price_gbp=100.00,
+        shipping_gbp=0.00,
+        historical_totals_gbp=[100.0],
+        is_retiring=True,
+    )
+    assert full_rrp.verdict == "WATCH (RETIRING)"

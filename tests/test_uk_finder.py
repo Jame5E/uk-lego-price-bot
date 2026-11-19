@@ -199,9 +199,13 @@ def test_amazon_uk_product_page_verification():
     assert bad is False
     assert offer is not None
     assert offer.item_price_gbp == 145.00
-    assert offer.shipping_gbp == 5.99
-    assert offer.total_gbp == 150.99
-    assert "3rd-party seller" in offer.shipping_note
+    assert offer.shipping_gbp == 0.00
+    assert offer.total_gbp == 145.00
+    assert "Amazon Prime" in offer.shipping_note
+
+    # Brickset Launch/exit date range ("01 Mar 25 - 31 Dec 26") should detect retiring=True
+    assert _uk_mod._parse_exit_date_status("01 Mar 25 - 31 Dec 26") == (True, False)
+    assert _uk_mod._parse_exit_date_status("01 Jan 20 - 31 Dec 22") == (False, True)
 
     dp_oos_html = dp_3p_html.replace("In stock", "Currently unavailable.")
     oos_offer, oos_bad = parse_amazon_uk_product_html(
