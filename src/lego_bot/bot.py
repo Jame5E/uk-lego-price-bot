@@ -435,6 +435,7 @@ class LegoTrackerBot(discord.Client):
         set_number: str | None = None,
         *,
         on_item_embed: Callable[[discord.Embed], Awaitable[None]] | None = None,
+        force_refresh: bool = False,
     ) -> list[discord.Embed]:
         assert self.http_session is not None
         if set_number:
@@ -557,6 +558,7 @@ class LegoTrackerBot(discord.Client):
                 prefer_click_and_collect=self.config.prefer_click_and_collect,
                 keepa_api_key=self.config.keepa_api_key,
                 proxy_url=self.config.proxy_url,
+                force_refresh=force_refresh,
             )
 
             title = format_item_title(item)
@@ -850,16 +852,23 @@ class LegoTrackerBot(discord.Client):
             return choices
 
         @wishlist_group.command(name="check", description="Check the current UK price of all items (or one specific set) on your wishlist")
-        @app_commands.describe(set_number="Optional LEGO set number to check (leave blank to check all)")
+        @app_commands.describe(
+            set_number="Optional LEGO set number to check (leave blank to check all)",
+            force="Bypass the 10-minute price cache and fetch fresh prices",
+        )
         @app_commands.autocomplete(set_number=_set_number_autocomplete)
-        async def wishlist_check(interaction: discord.Interaction, set_number: Optional[str] = None) -> None:
+        async def wishlist_check(
+            interaction: discord.Interaction,
+            set_number: Optional[str] = None,
+            force: bool = False,
+        ) -> None:
             await interaction.response.defer()
             try:
                 async def _send_one(embed: discord.Embed) -> None:
                     await interaction.followup.send(embed=embed)
 
                 await asyncio.wait_for(
-                    self.run_price_checks(set_number=set_number, on_item_embed=_send_one),
+                    self.run_price_checks(set_number=set_number, on_item_embed=_send_one, force_refresh=force),
                     timeout=COMMAND_TIMEOUT_SECONDS,
                 )
             except asyncio.TimeoutError:
@@ -1179,6 +1188,52 @@ class LegoTrackerBot(discord.Client):
                 "\n".join(lines),
                 color=discord.Color.blue(),
                 image_url=img,
+            )
+            await interaction.response.send_message(embed=embed)
+
+        @bot_group.command(name="status", description="Show bot schedule, cache stats, proxy mode, and source health")
+        async def bot_status(interaction: discord.Interaction) -> None:
+            items = self.db.list_items()
+            retiring_count = sum(1 for i in items if i.is_retiring)
+            cached_count, cache_ttl = get_price_cache_stats()
+            cooldowns = get_source_health()
+
+            next_run = self.price_check_loop.next_iteration
+            if next_run is not None:
+                delta = next_run - datetime.now(timezone.utc)
+                total_mins = max(0, int(delta.total_seconds() // 60))
+                hours, mins = divmod(total_mins, 60)
+                next_str = f"in **{hours}h {mins}m**" if hours else f"in **{mins}m**"
+            else:
+                next_str = "Not scheduled"
+
+            if cooldowns:
+                health_lines = "\n".join(
+                    f"• ⚠️ `{src}`: cooldown ({secs // 60}m {secs % 60}s left)"
+                    for src, secs in sorted(cooldowns.items())
+                )
+            else:
+                health_lines = "• ✅ All UK price sources healthy"
+
+            proxy_str = "Enabled (Webshare)" if self.config.proxy_url else "Direct (no proxy)"
+            api_parts = []
+            if self.config.brickset_api_key:
+                api_parts.append("Brickset")
+            if self.config.keepa_api_key:
+                api_parts.append("Keepa")
+            apis_str = ", ".join(api_parts) if api_parts else "None configured"
+
+            embed = make_status_embed(
+                "🤖 LEGO Bot Status",
+                (
+                    f"⏱️ **Check Interval:** Every {self.config.check_interval_minutes} min (next {next_str})\n"
+                    f"🧩 **Tracked Sets:** {len(items)} ({retiring_count} retiring soon)\n"
+                    f"💾 **Price Cache:** {cached_count} set(s) cached ({cache_ttl // 60}m TTL)\n"
+                    f"🌐 **Proxy:** {proxy_str}\n"
+                    f"🔑 **APIs:** {apis_str}\n\n"
+                    f"**Source Health:**\n{health_lines}"
+                ),
+                color=discord.Color.blue(),
             )
             await interaction.response.send_message(embed=embed)
 
