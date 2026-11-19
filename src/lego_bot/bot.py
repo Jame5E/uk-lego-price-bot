@@ -1318,6 +1318,96 @@ class LegoTrackerBot(discord.Client):
                     embed=make_error_embed("Price Check Error", str(exc))
                 )
 
+        @wishlist_group.command(
+            name="last_checked",
+            description="Show when a wishlist item (or all items) was last checked",
+        )
+        @app_commands.describe(set_number="Optional LEGO set number (leave blank to list all)")
+        @app_commands.autocomplete(set_number=_set_number_autocomplete)
+        async def wishlist_last_checked(
+            interaction: discord.Interaction,
+            set_number: Optional[str] = None,
+        ) -> None:
+            if set_number:
+                item = self.db.get_item_by_set_number(set_number)
+                if not item:
+                    await interaction.response.send_message(
+                        embed=make_error_embed("Not Found", f"Set `{set_number}` is not on your wishlist."),
+                        ephemeral=True,
+                    )
+                    return
+                last_dt = self.db.get_last_checked_at(item.id)
+                latest = self.db.get_latest_price(item.id)
+                if last_dt is not None:
+                    ts = int(last_dt.timestamp())
+                    checked_line = f"🕒 **Last Checked:** <t:{ts}:R> (<t:{ts}:f>)"
+                    min_age_s = (4.0 / 1.5 if item.is_retiring else 4.0) * 3600.0
+                    due_ts = int(last_dt.timestamp() + min_age_s)
+                    due_line = (
+                        "⏳ **Queue Status:** Due now"
+                        if time.time() >= due_ts
+                        else f"⏳ **Queue Status:** Eligible <t:{due_ts}:R>"
+                    )
+                else:
+                    checked_line = "🕒 **Last Checked:** *Never checked yet*"
+                    due_line = "⏳ **Queue Status:** Due now (priority)"
+
+                if latest is not None:
+                    rec_dt = datetime.fromisoformat(latest.recorded_at)
+                    if rec_dt.tzinfo is None:
+                        rec_dt = rec_dt.replace(tzinfo=timezone.utc)
+                    rec_ts = int(rec_dt.timestamp())
+                    price_line = f"🏷️ **Latest Price:** £{latest.total_gbp:.2f} *(recorded <t:{rec_ts}:R>)*"
+                else:
+                    price_line = "🏷️ **Latest Price:** *No price recorded yet*"
+
+                retire_line = "\n⚠️ **Status:** Retiring Soon (1.5× priority)" if item.is_retiring else ""
+                embed = make_status_embed(
+                    f"🕒 {format_item_title(item)}",
+                    f"{checked_line}\n{price_line}\n{due_line}{retire_line}",
+                    color=discord.Color.blue(),
+                    image_url=item.image_url or default_box_art_url(item.set_number),
+                )
+                await interaction.response.send_message(embed=embed)
+                return
+
+            items = self.db.list_items()
+            if not items:
+                await interaction.response.send_message(
+                    embed=make_status_embed("🕒 Last Checked", "Your wishlist is empty.", color=discord.Color.blue())
+                )
+                return
+
+            rows: list[tuple[float, str]] = []
+            for item in items:
+                last_dt = self.db.get_last_checked_at(item.id)
+                latest = self.db.get_latest_price(item.id)
+                price_txt = f" • £{latest.total_gbp:.2f}" if latest else ""
+                retire_tag = " ⚠️" if item.is_retiring else ""
+                title = format_item_title(item)
+                if last_dt is not None:
+                    ts = int(last_dt.timestamp())
+                    rows.append((last_dt.timestamp(), f"• **{title}**{retire_tag}: <t:{ts}:R>{price_txt}"))
+                else:
+                    rows.append((0.0, f"• **{title}**{retire_tag}: *Never checked*{price_txt}"))
+
+            rows.sort(key=lambda r: r[0])
+            lines = [line for _, line in rows]
+            page_size = 20
+            pages = [lines[i : i + page_size] for i in range(0, len(lines), page_size)]
+            embeds = [
+                make_status_embed(
+                    f"🕒 Wishlist Last Checked ({idx + 1}/{len(pages)})" if len(pages) > 1 else "🕒 Wishlist Last Checked",
+                    "\n".join(page),
+                    color=discord.Color.blue(),
+                    footer=f"{len(items)} tracked sets • Sorted oldest-checked first",
+                )
+                for idx, page in enumerate(pages)
+            ]
+            await interaction.response.send_message(embeds=embeds[:5])
+            for i in range(5, len(embeds), 5):
+                await interaction.followup.send(embeds=embeds[i : i + 5])
+
         @wishlist_group.command(name="edit", description="Edit alert settings for a tracked LEGO set")
         @app_commands.describe(
             set_number="LEGO set number (e.g. 10316)",
