@@ -381,6 +381,32 @@ class PingManagerView(discord.ui.View):
         )
 
 
+class CheckResultView(discord.ui.View):
+    """Interactive buttons attached to live price-check embeds."""
+
+    def __init__(self, bot: "LegoTrackerBot", set_number: str | None) -> None:
+        super().__init__(timeout=600)
+        self.bot = bot
+        self.set_number = set_number
+        if not set_number:
+            self.recheck_btn.disabled = True
+
+    @discord.ui.button(label="Re-check", emoji="🔄", style=discord.ButtonStyle.secondary)
+    async def recheck_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.set_number:
+            await interaction.response.send_message("Set number unavailable.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        embeds = await self.bot.run_price_checks(set_number=self.set_number, force_refresh=True)
+        if embeds:
+            await interaction.edit_original_response(embed=embeds[0], view=self)
+
+    @discord.ui.button(label="Manage Pings", emoji="🔔", style=discord.ButtonStyle.primary)
+    async def pings_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        view = PingManagerView(self.bot, target_user=interaction.user)
+        await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
+
+
 class LegoTrackerBot(discord.Client):
     def __init__(self, config: Config) -> None:
         intents = discord.Intents.default()
