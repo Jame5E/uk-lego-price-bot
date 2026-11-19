@@ -66,3 +66,42 @@ def test_parse_hotukdeals_search_html():
     assert offers[0].retailer == UKRetailer.SMYTHS
     assert offers[0].item_price_gbp == 149.99
     assert offers[0].url == "https://www.hotukdeals.com/deals/lego-42171-smyths"
+
+
+def test_price_cache_and_bot_imports():
+    import asyncio
+    import time
+    from src.lego_bot import bot as _bot_mod  # noqa: F401
+    from src.lego_bot.uk_finder import (
+        _PRICE_CACHE,
+        UKOffer,
+        find_best_uk_offer,
+        get_price_cache_stats,
+        get_source_health,
+    )
+
+    _PRICE_CACHE.clear()
+    _PRICE_CACHE["42171|0|0|"] = (
+        time.monotonic(),
+        UKOffer(
+            retailer=UKRetailer.LEGO_UK,
+            url="https://www.brickwatch.net/en-GB/set/42171/",
+            item_price_gbp=154.95,
+            shipping_gbp=0.0,
+            total_gbp=154.95,
+            shipping_note="Free UK delivery",
+        ),
+        [],
+    )
+    count, ttl = get_price_cache_stats()
+    assert count == 1
+    assert ttl == 600
+    assert isinstance(get_source_health(), dict)
+
+    offer, notes = asyncio.run(
+        find_best_uk_offer(None, name="LEGO 42171", set_number="42171")  # type: ignore[arg-type]
+    )
+    assert offer is not None
+    assert offer.total_gbp == 154.95
+    assert any("cache" in n.lower() for n in notes)
+    _PRICE_CACHE.clear()
