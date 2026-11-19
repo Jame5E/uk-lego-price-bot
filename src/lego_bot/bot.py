@@ -4,6 +4,7 @@ import asyncio
 import io
 import logging
 import os
+import sys
 import time
 from datetime import datetime, timezone
 from typing import Awaitable, Callable, Literal, Optional
@@ -17,15 +18,17 @@ from .chart import generate_price_chart
 from .config import Config
 from .db import PriceDatabase, TrackedItem
 from .predictor import PriceAnalysis, analyze_price
-from .shipping import UKRetailer, detect_retailer_from_url, estimate_uk_shipping
+from .shipping import APPROVED_UK_RETAILERS, UKRetailer, detect_retailer_from_url
 from .uk_finder import (
+    HAS_CURL_CFFI,
+    clean_set_display_name,
     default_box_art_url,
     find_best_uk_offer,
     get_price_cache_stats,
     get_source_health,
     lookup_set_metadata,
 )
-from .wishlist_store import remove_wishlist_entry, upsert_wishlist_entry
+from .wishlist_store import load_wishlist_entries, remove_wishlist_entry, upsert_wishlist_entry
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,9 +49,10 @@ def format_pings(
 
 
 def format_item_title(item: TrackedItem) -> str:
-    if item.set_number and item.set_number not in item.name:
-        return f"{item.name} (#{item.set_number})"
-    return item.name
+    display_name = clean_set_display_name(item.name, item.set_number) or item.name
+    if item.set_number and item.set_number not in display_name:
+        return f"{display_name} (#{item.set_number})"
+    return display_name
 
 
 def make_status_embed(
@@ -423,10 +427,54 @@ class LegoTrackerBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.http_session: aiohttp.ClientSession | None = None
         self._last_retiring_meta_check: dict[int, float] = {}
-        self.dev_mode: bool = os.getenv("DEV_MODE", "false").lower() == "true"
+        env_dev = os.getenv("DEV_MODE", "false").lower() == "true"
+        self.dev_mode: bool = self.db.get_dev_mode(default=env_dev)
+
+    def _startup_sync_and_clean(self) -> None:
+        """Sync wishlist.json into SQLite, clean legacy set titles, and purge poisoned history."""
+        entries = load_wishlist_entries(self.config.wishlist_path)
+        for entry in entries:
+            set_num = str(entry.get("set_number") or "").strip() or None
+            if not set_num or self.db.get_item_by_set_number(set_num) is not None:
+                continue
+            raw_name = str(entry.get("name") or f"LEGO Set #{set_num}").strip()
+            clean_name = clean_set_display_name(raw_name, set_num) or raw_name
+            notify_ids = [str(u) for u in (entry.get("notify_user_ids") or [])]
+            self.db.add_item(
+                name=clean_name,
+                rrp_gbp=float(entry["rrp_gbp"]) if entry.get("rrp_gbp") is not None else 0.0,
+                set_number=set_num,
+                category=str(entry.get("category") or "").strip() or None,
+                target_price_gbp=float(entry["target_price_gbp"]) if entry.get("target_price_gbp") is not None else None,
+                min_discount_pct=float(entry.get("min_discount_pct", 15.0)),
+                url=str(entry.get("url") or "").strip() or None,
+                retailer=detect_retailer_from_url(str(entry.get("url") or "").strip() or None).value,
+                is_retiring=bool(entry.get("is_retiring", False)),
+                image_url=str(entry.get("image_url") or "").strip() or default_box_art_url(set_num),
+                notify_user_ids=notify_ids,
+            )
+
+        for item in self.db.list_items():
+            cleaned = clean_set_display_name(item.name, item.set_number)
+            if cleaned and cleaned != item.name:
+                self.db.update_item(item.id, name=cleaned)
+                if item.set_number:
+                    upsert_wishlist_entry(
+                        self.config.wishlist_path,
+                        {"name": cleaned, "set_number": item.set_number},
+                    )
+
+        deleted_rows, reset_items = self.db.purge_implausible_history()
+        if deleted_rows or reset_items:
+            logger.info(
+                "Startup DB cleanup removed %d implausible history row(s) and reset %d poisoned alert(s)",
+                deleted_rows,
+                reset_items,
+            )
 
     async def setup_hook(self) -> None:
-        connector = aiohttp.TCPConnector(limit=12, ttl_dns_cache=300)
+        self._startup_sync_and_clean()
+        connector = aiohttp.TCPConnector(limit=16, ttl_dns_cache=300)
         self.http_session = aiohttp.ClientSession(connector=connector)
         self._register_commands()
 
@@ -456,7 +504,7 @@ class LegoTrackerBot(discord.Client):
     @tasks.loop(minutes=30)
     async def price_check_loop(self) -> None:
         try:
-            await asyncio.wait_for(self.run_price_checks(), timeout=600.0)
+            await asyncio.wait_for(self.run_price_checks(scheduled=True), timeout=600.0)
         except Exception as exc:
             logger.error("Scheduled price check failed: %s", exc)
 
@@ -464,21 +512,58 @@ class LegoTrackerBot(discord.Client):
     async def before_price_check_loop(self) -> None:
         await self.wait_until_ready()
 
+    async def _maybe_send_weekly_summary(self, channel: object) -> None:
+        if not self.db.should_send_weekly_summary() or not isinstance(channel, discord.abc.Messageable):
+            return
+        lines = []
+        for item in self.db.list_items():
+            hist = self.db.get_price_history(item.id, limit=1)
+            low = self.db.get_historical_low(item.id)
+            t = format_item_title(item)
+            if hist:
+                low_str = f" | Low £{low:.2f}" if low is not None else ""
+                lines.append(f"• **{t}**: **£{hist[0].total_gbp:.2f}**{low_str}")
+            else:
+                lines.append(f"• **{t}**: *No price recorded yet*")
+        summary_embed = make_status_embed(
+            "📊 Weekly UK LEGO Wishlist Summary",
+            "\n".join(lines) if lines else "Your wishlist is empty.",
+            color=discord.Color.blue(),
+        )
+        if self.dev_mode:
+            summary_content = "🛠️ [DEV MODE] Weekly LEGO summary! *(pings suppressed)*"
+            allowed = discord.AllowedMentions.none()
+        else:
+            summary_pings = " ".join(
+                f"<@{uid}>"
+                for uid in dict.fromkeys([str(self.config.user_id), *self.config.extra_notify_user_ids])
+            )
+            summary_content = f"{summary_pings} Weekly LEGO summary!"
+            allowed = discord.AllowedMentions.all()
+        await channel.send(content=summary_content, embed=summary_embed, allowed_mentions=allowed)
+        self.db.mark_weekly_summary_sent()
+
     async def run_price_checks(
         self,
         set_number: str | None = None,
         *,
         on_item_embed: Callable[[discord.Embed, Optional[discord.ui.View]], Awaitable[None]] | None = None,
         force_refresh: bool = False,
+        scheduled: bool = False,
     ) -> list[discord.Embed]:
         assert self.http_session is not None
         if set_number:
             found = self.db.get_item_by_set_number(set_number)
             items = [found] if found else []
+        elif scheduled:
+            all_items = self.db.list_items()
+            if not all_items:
+                return []
+            items = self.db.get_items_due_for_check(min_age_hours=4.0)[:4]
         else:
             items = self.db.list_items()
 
-        if not items:
+        if not items and not scheduled:
             empty_embed = make_status_embed("🧩 Your LEGO Wishlist", "No tracked LEGO items found.")
             if on_item_embed is not None:
                 await on_item_embed(empty_embed, None)
@@ -490,251 +575,297 @@ class LegoTrackerBot(discord.Client):
                 channel = await self.fetch_channel(self.config.channel_id)
             except Exception as exc:
                 logger.error("Could not fetch alert channel %s: %s", self.config.channel_id, exc)
-                err_embed = make_error_embed("Channel Error", f"Could not access alert channel {self.config.channel_id}.")
-                if on_item_embed is not None:
-                    await on_item_embed(err_embed, None)
-                return [err_embed]
+                if not scheduled:
+                    err_embed = make_error_embed(
+                        "Channel Error", f"Could not access alert channel {self.config.channel_id}."
+                    )
+                    if on_item_embed is not None:
+                        await on_item_embed(err_embed, None)
+                    return [err_embed]
+                return []
+
+        if scheduled and not items:
+            await self._maybe_send_weekly_summary(channel)
+            return []
 
         now_mono = time.monotonic()
         result_embeds: list[discord.Embed] = []
+        emit_lock = asyncio.Lock()
+        sem = asyncio.Semaphore(1 if scheduled else 3)
+        interactive_serp_budget = [5 if set_number is None else 1]
 
         async def _emit(embed: discord.Embed, item_set_number: str | None = None) -> None:
-            result_embeds.append(embed)
-            if on_item_embed is not None:
-                view = CheckResultView(self, item_set_number) if item_set_number else None
-                await on_item_embed(embed, view)
+            async with emit_lock:
+                result_embeds.append(embed)
+                if on_item_embed is not None:
+                    view = CheckResultView(self, item_set_number) if item_set_number else None
+                    await on_item_embed(embed, view)
 
-        for idx, item in enumerate(items):
-            if idx > 0:
-                await asyncio.sleep(1.2)
+        async def _check_one(idx: int, item: TrackedItem) -> None:
+            async with sem:
+                if scheduled and idx > 0:
+                    await asyncio.sleep(1.0)
 
-            rrp = item.rrp_gbp
-            is_retiring = item.is_retiring
-            image_url = item.image_url
-            resolved_name = item.name
-            category = item.category
+                rrp = item.rrp_gbp
+                is_retiring = item.is_retiring
+                image_url = item.image_url
+                resolved_name = clean_set_display_name(item.name, item.set_number) or item.name
+                category = item.category
 
-            meta_ttl = 86400.0 if is_retiring else 604800.0
-            meta_refresh_due = (
-                now_mono - self._last_retiring_meta_check.get(item.id, 0.0) >= meta_ttl
-            )
-            needs_meta = (
-                rrp <= 0
-                or not image_url
-                or not category
-                or not resolved_name
-                or resolved_name.startswith("LEGO Set #")
-                or meta_refresh_due
-            )
-            meta = None
-            if needs_meta and item.set_number:
-                meta = await lookup_set_metadata(
-                    self.http_session,
-                    item.set_number,
-                    brickset_api_key=self.config.brickset_api_key,
-                    proxy_url=self.config.proxy_url,
+                meta_ttl = 86400.0 if is_retiring else 604800.0
+                meta_refresh_due = (
+                    now_mono - self._last_retiring_meta_check.get(item.id, 0.0) >= meta_ttl
                 )
-                self._last_retiring_meta_check[item.id] = now_mono
-                if meta.is_retired:
-                    title = format_item_title(item)
-                    box_art = item.image_url or default_box_art_url(item.set_number)
-                    self.db.remove_item(item.id)
+                needs_meta = (
+                    rrp <= 0
+                    or not image_url
+                    or not category
+                    or not resolved_name
+                    or resolved_name.startswith("LEGO Set #")
+                    or meta_refresh_due
+                )
+                if needs_meta and item.set_number:
+                    meta = await lookup_set_metadata(
+                        self.http_session,  # type: ignore[arg-type]
+                        item.set_number,
+                        brickset_api_key=self.config.brickset_api_key,
+                        proxy_url=self.config.proxy_url,
+                    )
+                    self._last_retiring_meta_check[item.id] = now_mono
+                    if meta.is_retired:
+                        title = format_item_title(item)
+                        box_art = item.image_url or default_box_art_url(item.set_number)
+                        self.db.remove_item(item.id)
+                        if item.set_number:
+                            remove_wishlist_entry(self.config.wishlist_path, item.set_number)
+                        await _emit(
+                            make_status_embed(
+                                f"📦 Removed Retired Set: {title}",
+                                "This LEGO set has now **retired** and was automatically removed from your wishlist.",
+                                color=discord.Color.dark_grey(),
+                                image_url=box_art,
+                            )
+                        )
+                        return
+
+                    if meta.name and (resolved_name.startswith("LEGO Set #") or len(meta.name) >= len(resolved_name) - 4):
+                        resolved_name = clean_set_display_name(meta.name, item.set_number) or meta.name
+                    if not category and meta.category:
+                        category = meta.category
+                    if rrp <= 0 and meta.rrp_gbp:
+                        rrp = meta.rrp_gbp
+                    if meta.source in ("brickset", "brickset_web", "lego_uk"):
+                        is_retiring = meta.is_retiring
+                    if not image_url and meta.image_url:
+                        image_url = meta.image_url
+
+                    self.db.update_item(
+                        item.id,
+                        name=resolved_name,
+                        category=category,
+                        rrp_gbp=rrp if rrp > 0 else None,
+                        is_retiring=is_retiring,
+                        image_url=image_url,
+                    )
+                    item = self.db.get_item(item.id) or item
                     if item.set_number:
-                        remove_wishlist_entry(self.config.wishlist_path, item.set_number)
+                        upsert_wishlist_entry(
+                            self.config.wishlist_path,
+                            {
+                                "name": item.name,
+                                "set_number": item.set_number,
+                                "category": item.category,
+                                "rrp_gbp": item.rrp_gbp if item.rrp_gbp > 0 else None,
+                                "is_retiring": item.is_retiring,
+                                "image_url": item.image_url,
+                            },
+                        )
+
+                allow_serpapi = False
+                if self.config.serpapi_key:
+                    if scheduled:
+                        allow_serpapi, _ = self.db.can_spend_token(
+                            "serpapi", self.config.serpapi_monthly_limit, manual_force=False
+                        )
+                    elif force_refresh and interactive_serp_budget[0] > 0:
+                        allow_serpapi, _ = self.db.can_spend_token(
+                            "serpapi", self.config.serpapi_monthly_limit, manual_force=True
+                        )
+                        if allow_serpapi:
+                            interactive_serp_budget[0] -= 1
+
+                best_offer, notes = await find_best_uk_offer(
+                    self.http_session,  # type: ignore[arg-type]
+                    name=resolved_name,
+                    set_number=item.set_number,
+                    direct_url=item.url,
+                    rrp_gbp=rrp if rrp > 0 else None,
+                    has_amazon_prime=self.config.has_amazon_prime,
+                    prefer_click_and_collect=self.config.prefer_click_and_collect,
+                    serpapi_key=self.config.serpapi_key,
+                    allow_serpapi=allow_serpapi,
+                    on_serpapi_credit_used=lambda: self.db.increment_monthly_usage("serpapi"),
+                    proxy_url=self.config.proxy_url,
+                    force_refresh=force_refresh,
+                )
+
+                title = format_item_title(item)
+                box_art = item.image_url or default_box_art_url(item.set_number)
+                cat_line = f"📂 **Category:** {item.category}\n" if item.category else ""
+
+                if best_offer is None:
+                    # During 0-token interactive checks, fall back to latest verified UK retailer price if recorded
+                    latest = self.db.get_latest_price(item.id) if not scheduled and not force_refresh else None
+                    rec_retailer = UKRetailer.OTHER
+                    if latest is not None:
+                        try:
+                            rec_retailer = UKRetailer(latest.retailer)
+                        except ValueError:
+                            rec_retailer = UKRetailer.OTHER
+
+                    if latest is not None and rec_retailer in APPROVED_UK_RETAILERS:
+                        eff_rrp = rrp if rrp > 0 else latest.price_gbp
+                        hist_totals = [h.total_gbp for h in self.db.get_price_history(item.id, limit=90)]
+                        cached_analysis = analyze_price(
+                            rrp_gbp=eff_rrp,
+                            item_price_gbp=latest.price_gbp,
+                            shipping_gbp=latest.shipping_gbp,
+                            historical_totals_gbp=hist_totals,
+                            is_retiring=is_retiring,
+                        )
+                        icon = (
+                            "🟢"
+                            if "BUY NOW" in cached_analysis.verdict
+                            else ("🟡" if "GOOD" in cached_analysis.verdict or "SOON" in cached_analysis.verdict else "🟠")
+                        )
+                        await _emit(
+                            make_status_embed(
+                                f"🧩 {title}",
+                                (
+                                    f"{cat_line}"
+                                    f"## 🏷️ Last Verified Price: £{cached_analysis.total_gbp:.2f}\n"
+                                    f"### Normal RRP: £{cached_analysis.rrp_gbp:.2f}  •  **{cached_analysis.discount_pct:.1f}% OFF**\n"
+                                    f"📍 **Seller:** {rec_retailer.display_name} *(recorded `{latest.recorded_at[:10]}`)*\n"
+                                    f"{icon} **{cached_analysis.verdict}**"
+                                ),
+                                color=discord.Color.blue(),
+                                image_url=box_art,
+                                footer="Cached DB price • Click Re-check for a fresh scan",
+                            ),
+                            item.set_number,
+                        )
+                        return
+
+                    rrp_line = f"💷 **Normal RRP:** £{rrp:.2f}\n" if rrp > 0 else ""
+                    diag = "\n".join(f"• {n}" for n in notes[:5]) if notes else "No approved UK retailers had stock."
                     await _emit(
                         make_status_embed(
-                            f"📦 Removed Retired Set: {title}",
-                            "This LEGO set has now **retired** and was automatically removed from your wishlist.",
-                            color=discord.Color.dark_grey(),
+                            f"🧩 {title}",
+                            (
+                                f"{cat_line}{rrp_line}"
+                                f"⚠️ **No live in-stock UK offers found right now**\n"
+                                f"*Sources checked:*\n{diag}"
+                            ),
+                            color=discord.Color.orange(),
                             image_url=box_art,
-                        )
+                            footer="Checked approved UK retailers • GBP (£) inc. delivery",
+                        ),
+                        item.set_number,
                     )
-                    continue
+                    return
 
-                if meta.name and (resolved_name.startswith("LEGO Set #") or len(meta.name) > len(resolved_name)):
-                    resolved_name = meta.name
-                if not category and meta.category:
-                    category = meta.category
-                if rrp <= 0 and meta.rrp_gbp:
-                    rrp = meta.rrp_gbp
-                if meta.source in ("brickset", "brickset_web", "lego_uk"):
-                    is_retiring = meta.is_retiring
-                if not image_url and meta.image_url:
-                    image_url = meta.image_url
+                if rrp <= 0:
+                    rrp = best_offer.item_price_gbp
 
-                self.db.update_item(
+                prev_low = self.db.get_historical_low(item.id)
+                is_all_time_low = prev_low is not None and best_offer.total_gbp < prev_low
+
+                history = self.db.get_price_history(item.id, limit=90)
+                hist_totals = [h.total_gbp for h in history]
+                if best_offer.historical_low_gbp is not None:
+                    hist_totals.append(best_offer.historical_low_gbp)
+                if best_offer.historical_avg_gbp is not None:
+                    hist_totals.append(best_offer.historical_avg_gbp)
+
+                self.db.record_price(
                     item.id,
-                    name=resolved_name,
-                    category=category,
-                    rrp_gbp=rrp if rrp > 0 else None,
-                    is_retiring=is_retiring,
-                    image_url=image_url,
+                    best_offer.item_price_gbp,
+                    best_offer.shipping_gbp,
+                    best_offer.total_gbp,
+                    best_offer.retailer.value,
                 )
-                item = self.db.get_item(item.id) or item
-                if item.set_number:
-                    upsert_wishlist_entry(
-                        self.config.wishlist_path,
-                        {
-                            "name": item.name,
-                            "set_number": item.set_number,
-                            "category": item.category,
-                            "rrp_gbp": item.rrp_gbp if item.rrp_gbp > 0 else None,
-                            "is_retiring": item.is_retiring,
-                            "image_url": item.image_url,
-                        },
-                    )
 
-            best_offer, notes = await find_best_uk_offer(
-                self.http_session,
-                name=resolved_name,
-                set_number=item.set_number,
-                direct_url=item.url,
-                rrp_gbp=rrp if rrp > 0 else None,
-                has_amazon_prime=self.config.has_amazon_prime,
-                prefer_click_and_collect=self.config.prefer_click_and_collect,
-                proxy_url=self.config.proxy_url,
-                force_refresh=force_refresh,
-            )
+                analysis = analyze_price(
+                    rrp_gbp=rrp,
+                    item_price_gbp=best_offer.item_price_gbp,
+                    shipping_gbp=best_offer.shipping_gbp,
+                    historical_totals_gbp=hist_totals,
+                    is_retiring=is_retiring,
+                )
 
-            title = format_item_title(item)
-            box_art = item.image_url or default_box_art_url(item.set_number)
-            cat_line = f"📂 **Category:** {item.category}\n" if item.category else ""
-
-            if best_offer is None:
-                rrp_line = f"💷 **Normal RRP:** £{rrp:.2f}\n" if rrp > 0 else ""
-                diag = "\n".join(f"• {n}" for n in notes[:5]) if notes else "No retailers responded."
+                icon = "🟢" if "BUY NOW" in analysis.verdict else ("🟡" if "GOOD" in analysis.verdict or "SOON" in analysis.verdict else "🟠")
+                color = discord.Color.green() if "BUY NOW" in analysis.verdict else (discord.Color.gold() if "GOOD" in analysis.verdict or "SOON" in analysis.verdict else discord.Color.blue())
                 await _emit(
                     make_status_embed(
                         f"🧩 {title}",
                         (
-                            f"{cat_line}{rrp_line}"
-                            f"⚠️ **No live UK offers found right now**\n"
-                            f"*Sources checked:*\n{diag}"
+                            f"{cat_line}"
+                            f"## 🏷️ Deal Price: £{analysis.total_gbp:.2f}\n"
+                            f"### Normal RRP: £{analysis.rrp_gbp:.2f}  •  **{analysis.discount_pct:.1f}% OFF**\n"
+                            f"📍 **Seller:** {best_offer.retailer.display_name}\n"
+                            f"{icon} **{analysis.verdict}** — [View Deal →]({best_offer.url})"
                         ),
-                        color=discord.Color.orange(),
+                        color=color,
                         image_url=box_art,
                         footer="Prices in GBP (£) including estimated UK delivery",
                     ),
                     item.set_number,
                 )
-                continue
 
-            if rrp <= 0:
-                rrp = best_offer.item_price_gbp
+                hit_target = item.target_price_gbp is not None and analysis.total_gbp <= item.target_price_gbp
+                hit_discount = analysis.discount_pct >= item.min_discount_pct
+                if not (hit_target or hit_discount):
+                    if item.last_alert_price_gbp is not None:
+                        self.db.reset_alert_state(item.id)
+                elif self.db.should_alert(
+                    item, analysis.total_gbp, self.config.alert_cooldown_hours
+                ):
+                    series = list(reversed([h.total_gbp for h in self.db.get_price_history(item.id, limit=30)]))
+                    chart_bytes = generate_price_chart(series, rrp) if len(series) >= 2 else None
+                    embeds = build_alert_embeds(
+                        item,
+                        analysis,
+                        best_offer.retailer,
+                        best_offer.shipping_note,
+                        offer_url=best_offer.url,
+                        is_all_time_low=is_all_time_low,
+                        has_chart=chart_bytes is not None,
+                    )
+                    if isinstance(channel, discord.abc.Messageable):
+                        if self.dev_mode:
+                            alert_content = "🛠️ [DEV MODE] LEGO sale spotted! *(pings suppressed)*"
+                            allowed = discord.AllowedMentions.none()
+                        else:
+                            pings = format_pings(
+                                self.config.user_id,
+                                item,
+                                extra_user_ids=self.config.extra_notify_user_ids,
+                            )
+                            alert_content = f"{pings} LEGO sale spotted!"
+                            allowed = discord.AllowedMentions.all()
+                        if chart_bytes:
+                            file = discord.File(io.BytesIO(chart_bytes), filename="chart.png")
+                            await channel.send(
+                                content=alert_content, embeds=embeds, file=file, allowed_mentions=allowed
+                            )
+                        else:
+                            await channel.send(content=alert_content, embeds=embeds, allowed_mentions=allowed)
+                        self.db.mark_alerted(item.id, analysis.total_gbp)
 
-            prev_low = self.db.get_historical_low(item.id)
-            is_all_time_low = prev_low is not None and best_offer.total_gbp < prev_low
+        await asyncio.gather(*(_check_one(idx, it) for idx, it in enumerate(items)))
 
-            history = self.db.get_price_history(item.id, limit=90)
-            hist_totals = [h.total_gbp for h in history]
-            if best_offer.historical_low_gbp is not None:
-                hist_totals.append(best_offer.historical_low_gbp)
-            if best_offer.historical_avg_gbp is not None:
-                hist_totals.append(best_offer.historical_avg_gbp)
-
-            self.db.record_price(
-                item.id,
-                best_offer.item_price_gbp,
-                best_offer.shipping_gbp,
-                best_offer.total_gbp,
-                best_offer.retailer.value,
-            )
-
-            analysis = analyze_price(
-                rrp_gbp=rrp,
-                item_price_gbp=best_offer.item_price_gbp,
-                shipping_gbp=best_offer.shipping_gbp,
-                historical_totals_gbp=hist_totals,
-                is_retiring=is_retiring,
-            )
-
-            icon = "🟢" if "BUY NOW" in analysis.verdict else ("🟡" if "GOOD" in analysis.verdict or "SOON" in analysis.verdict else "🟠")
-            color = discord.Color.green() if "BUY NOW" in analysis.verdict else (discord.Color.gold() if "GOOD" in analysis.verdict or "SOON" in analysis.verdict else discord.Color.blue())
-            await _emit(
-                make_status_embed(
-                    f"🧩 {title}",
-                    (
-                        f"{cat_line}"
-                        f"## 🏷️ Deal Price: £{analysis.total_gbp:.2f}\n"
-                        f"### Normal RRP: £{analysis.rrp_gbp:.2f}  •  **{analysis.discount_pct:.1f}% OFF**\n"
-                        f"📍 **Seller:** {best_offer.retailer.display_name}\n"
-                        f"{icon} **{analysis.verdict}** — [View Deal →]({best_offer.url})"
-                    ),
-                    color=color,
-                    image_url=box_art,
-                    footer="Prices in GBP (£) including estimated UK delivery",
-                ),
-                item.set_number,
-            )
-
-            hit_target = item.target_price_gbp is not None and analysis.total_gbp <= item.target_price_gbp
-            hit_discount = analysis.discount_pct >= item.min_discount_pct
-            if not (hit_target or hit_discount):
-                if item.last_alert_price_gbp is not None:
-                    self.db.reset_alert_state(item.id)
-            elif self.db.should_alert(
-                item, analysis.total_gbp, self.config.alert_cooldown_hours
-            ):
-                series = list(reversed([h.total_gbp for h in self.db.get_price_history(item.id, limit=30)]))
-                chart_bytes = generate_price_chart(series, rrp) if len(series) >= 2 else None
-                embeds = build_alert_embeds(
-                    item,
-                    analysis,
-                    best_offer.retailer,
-                    best_offer.shipping_note,
-                    offer_url=best_offer.url,
-                    is_all_time_low=is_all_time_low,
-                    has_chart=chart_bytes is not None,
-                )
-                if isinstance(channel, discord.abc.Messageable):
-                    if self.dev_mode:
-                        alert_content = "🛠️ [DEV MODE] LEGO sale spotted! *(pings suppressed)*"
-                        allowed = discord.AllowedMentions.none()
-                    else:
-                        pings = format_pings(
-                            self.config.user_id,
-                            item,
-                            extra_user_ids=self.config.extra_notify_user_ids,
-                        )
-                        alert_content = f"{pings} LEGO sale spotted!"
-                        allowed = discord.AllowedMentions.all()
-                    if chart_bytes:
-                        file = discord.File(io.BytesIO(chart_bytes), filename="chart.png")
-                        await channel.send(
-                            content=alert_content, embeds=embeds, file=file, allowed_mentions=allowed
-                        )
-                    else:
-                        await channel.send(content=alert_content, embeds=embeds, allowed_mentions=allowed)
-                    self.db.mark_alerted(item.id, analysis.total_gbp)
-
-        if not set_number and self.db.should_send_weekly_summary() and isinstance(channel, discord.abc.Messageable):
-            lines = []
-            for item in self.db.list_items():
-                hist = self.db.get_price_history(item.id, limit=1)
-                low = self.db.get_historical_low(item.id)
-                t = format_item_title(item)
-                if hist:
-                    low_str = f" | Low £{low:.2f}" if low is not None else ""
-                    lines.append(f"• **{t}**: **£{hist[0].total_gbp:.2f}**{low_str}")
-                else:
-                    lines.append(f"• **{t}**: *No price recorded yet*")
-            summary_embed = make_status_embed(
-                "📊 Weekly UK LEGO Wishlist Summary",
-                "\n".join(lines) if lines else "Your wishlist is empty.",
-                color=discord.Color.blue(),
-            )
-            if self.dev_mode:
-                summary_content = "🛠️ [DEV MODE] Weekly LEGO summary! *(pings suppressed)*"
-                allowed = discord.AllowedMentions.none()
-            else:
-                summary_pings = " ".join(
-                    f"<@{uid}>"
-                    for uid in dict.fromkeys([str(self.config.user_id), *self.config.extra_notify_user_ids])
-                )
-                summary_content = f"{summary_pings} Weekly LEGO summary!"
-                allowed = discord.AllowedMentions.all()
-            await channel.send(content=summary_content, embed=summary_embed, allowed_mentions=allowed)
-            self.db.mark_weekly_summary_sent()
+        if scheduled and not set_number:
+            await self._maybe_send_weekly_summary(channel)
 
         return result_embeds
 
@@ -908,7 +1039,7 @@ class LegoTrackerBot(discord.Client):
         @wishlist_group.command(name="check", description="Check the current UK price of all items (or one specific set) on your wishlist")
         @app_commands.describe(
             set_number="Optional LEGO set number to check (leave blank to check all)",
-            force="Bypass the 10-minute price cache and fetch fresh prices",
+            force="Bypass the 30-minute price cache and fetch fresh UK prices",
         )
         @app_commands.autocomplete(set_number=_set_number_autocomplete)
         async def wishlist_check(
@@ -930,7 +1061,7 @@ class LegoTrackerBot(discord.Client):
                 )
             except asyncio.TimeoutError:
                 await interaction.followup.send(
-                    embed=make_error_embed("Price Check Timed Out", "UK retailers took too long to respond (>10m). Please try again.")
+                    embed=make_error_embed("Price Check Timed Out", "UK retailers took too long to respond (>5m). Please try again.")
                 )
             except Exception as exc:
                 logger.exception("wishlist check failed")
@@ -1251,7 +1382,7 @@ class LegoTrackerBot(discord.Client):
             )
             await interaction.response.send_message(embed=embed)
 
-        @bot_group.command(name="status", description="Show bot schedule, cache stats, proxy mode, and source health")
+        @bot_group.command(name="status", description="Show bot schedule, UK retailer engine, monthly token quota, and source health")
         async def bot_status(interaction: discord.Interaction) -> None:
             items = self.db.list_items()
             retiring_count = sum(1 for i in items if i.is_retiring)
@@ -1273,24 +1404,28 @@ class LegoTrackerBot(discord.Client):
                     for src, secs in sorted(cooldowns.items())
                 )
             else:
-                health_lines = "• ✅ All UK price sources healthy"
+                health_lines = "• ✅ All direct UK stores healthy"
 
-            proxy_str = "Enabled (Webshare)" if self.config.proxy_url else "Direct (no proxy)"
-            api_parts = []
-            if self.config.brickset_api_key:
-                api_parts.append("Brickset")
-            apis_str = ", ".join(api_parts) if api_parts else "None configured"
+            engine_str = "Chrome TLS (`curl_cffi`)" if HAS_CURL_CFFI else "Standard HTTP (`aiohttp`)"
+            if self.config.serpapi_key:
+                used = self.db.get_monthly_usage("serpapi")
+                _, today_cap = self.db.can_spend_token("serpapi", self.config.serpapi_monthly_limit, manual_force=False)
+                quota_str = f"**{used} / {self.config.serpapi_monthly_limit}** used this month *(auto pace cap today: {today_cap})*"
+            else:
+                quota_str = "Not configured *(0-signup Direct UK Store mode)*"
 
+            stores_str = ", ".join(r.display_name for r in APPROVED_UK_RETAILERS)
             dev_str = "ON (pings suppressed)" if self.dev_mode else "OFF"
             embed = make_status_embed(
                 "🤖 LEGO Bot Status",
                 (
-                    f"⏱️ **Check Interval:** Every {self.config.check_interval_minutes} min (next {next_str})\n"
+                    f"⏱️ **Check Tick:** Every {self.config.check_interval_minutes} min (next {next_str} • ≥4h staleness queue)\n"
                     f"🧩 **Tracked Sets:** {len(items)} ({retiring_count} retiring soon)\n"
                     f"💾 **Price Cache:** {cached_count} set(s) cached ({cache_ttl // 60}m TTL)\n"
                     f"🛠️ **Dev Mode:** {dev_str}\n"
-                    f"🌐 **Proxy:** {proxy_str}\n"
-                    f"🔑 **APIs:** {apis_str}\n\n"
+                    f"🌐 **Direct Engine:** {engine_str}\n"
+                    f"🎟️ **Google Shopping Quota:** {quota_str}\n"
+                    f"🛒 **Approved UK Stores ({len(APPROVED_UK_RETAILERS)}):** {stores_str}\n\n"
                     f"**Source Health:**\n{health_lines}"
                 ),
                 color=discord.Color.blue(),
@@ -1301,16 +1436,30 @@ class LegoTrackerBot(discord.Client):
         @app_commands.describe(enabled="Set True to enable or False to disable (leave blank to toggle)")
         async def bot_devmode(interaction: discord.Interaction, enabled: Optional[bool] = None) -> None:
             self.dev_mode = (not self.dev_mode) if enabled is None else enabled
+            self.db.set_dev_mode(self.dev_mode)
             state = "ON (pings suppressed)" if self.dev_mode else "OFF (normal pings enabled)"
             color = discord.Color.orange() if self.dev_mode else discord.Color.green()
             embed = make_status_embed(
                 f"🛠️ Dev Mode: {'ON' if self.dev_mode else 'OFF'}",
-                f"Dev mode is now **{state}**.",
+                f"Dev mode is now **{state}** *(saved across restarts)*.",
                 color=color,
             )
             await interaction.response.send_message(embed=embed)
 
-        @bot_group.command(name="update", description="Pull the latest code from GitHub and restart the bot")
+        @bot_group.command(name="clean_history", description="Purge bogus/outlier historical prices and reset poisoned alert states")
+        async def bot_clean_history(interaction: discord.Interaction) -> None:
+            deleted_rows, reset_items = self.db.purge_implausible_history()
+            embed = make_status_embed(
+                "🧹 Price History Cleaned",
+                (
+                    f"• **Removed outlier/unverified history rows:** {deleted_rows}\n"
+                    f"• **Reset poisoned alert states:** {reset_items}"
+                ),
+                color=discord.Color.green(),
+            )
+            await interaction.response.send_message(embed=embed)
+
+        @bot_group.command(name="update", description="Pull the latest code from GitHub, sync dependencies, and restart the bot")
         async def bot_update(interaction: discord.Interaction) -> None:
             await interaction.response.defer()
             try:
@@ -1336,15 +1485,46 @@ class LegoTrackerBot(discord.Client):
                         ephemeral=True,
                     )
                     return
+
+                pip_note = ""
+                try:
+                    pip_proc = await asyncio.create_subprocess_exec(
+                        sys.executable, "-m", "pip", "install", "-q", "-r", "requirements.txt",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    _, pip_err = await asyncio.wait_for(pip_proc.communicate(), timeout=45.0)
+                    if pip_proc.returncode != 0:
+                        err_txt = (pip_err or b"").decode()
+                        if "externally-managed-environment" in err_txt:
+                            pip_proc2 = await asyncio.create_subprocess_exec(
+                                sys.executable, "-m", "pip", "install", "--user", "--break-system-packages", "-q", "-r", "requirements.txt",
+                                stdout=asyncio.subprocess.PIPE,
+                                stderr=asyncio.subprocess.PIPE,
+                            )
+                            await asyncio.wait_for(pip_proc2.communicate(), timeout=45.0)
+                            pip_note = "\n✅ Synced Python packages (`--user`)." if pip_proc2.returncode == 0 else "\n⚠️ `pip install` warning (continuing restart)."
+                        else:
+                            pip_note = "\n⚠️ `pip install` warning (continuing restart)."
+                    else:
+                        pip_note = "\n✅ Synced Python packages (`requirements.txt`)."
+                except Exception as pip_exc:
+                    logger.warning("pip install during /bot update failed: %s", pip_exc)
+                    pip_note = "\n⚠️ Skipped package sync (restarting with updated code)."
+
                 await interaction.followup.send(
-                    embed=make_status_embed("🔄 Updating & Restarting", f"Pulled latest code from GitHub:\n```{output[:1000]}```", color=discord.Color.green()),
+                    embed=make_status_embed(
+                        "🔄 Updating & Restarting",
+                        f"Pulled latest code from GitHub:\n```{output[:1000]}```{pip_note}",
+                        color=discord.Color.green(),
+                    ),
                     ephemeral=True,
                 )
                 await self.close()
                 os._exit(0)
             except asyncio.TimeoutError:
                 await interaction.followup.send(
-                    embed=make_error_embed("Update Timed Out", "Git pull took too long (>20s)."),
+                    embed=make_error_embed("Update Timed Out", "Update command took too long."),
                     ephemeral=True,
                 )
             except Exception as exc:

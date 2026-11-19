@@ -18,6 +18,8 @@ class Config:
     has_amazon_prime: bool
     prefer_click_and_collect: bool
     brickset_api_key: str | None
+    serpapi_key: str | None = None
+    serpapi_monthly_limit: int = 250
     extra_notify_user_ids: tuple[str, ...] = ("942902769319292948",)
     proxy_url: str | None = None
 
@@ -39,6 +41,9 @@ class Config:
         if not user_raw.isdigit() or int(user_raw) == 0:
             raise ValueError("DISCORD_USER_ID must be a valid Discord user ID")
 
+        raw_limit = os.getenv("SERPAPI_MONTHLY_LIMIT", "250").strip()
+        serp_limit = max(10, int(raw_limit)) if raw_limit.isdigit() else 250
+
         return cls(
             discord_token=token,
             channel_id=int(channel_raw),
@@ -51,6 +56,8 @@ class Config:
             has_amazon_prime=os.getenv("HAS_AMAZON_PRIME", "false").lower() == "true",
             prefer_click_and_collect=os.getenv("PREFER_CLICK_AND_COLLECT", "false").lower() == "true",
             brickset_api_key=os.getenv("BRICKSET_API_KEY", "").strip() or None,
+            serpapi_key=os.getenv("SERPAPI_KEY", "").strip() or None,
+            serpapi_monthly_limit=serp_limit,
             extra_notify_user_ids=extra_ids,
             proxy_url=os.getenv("PROXY_URL", "").strip() or None,
         )

@@ -13,7 +13,12 @@ from src.lego_bot.chart import generate_price_chart
 from src.lego_bot.db import PriceDatabase, TrackedItem
 from src.lego_bot.predictor import PriceAnalysis, analyze_price
 from src.lego_bot.shipping import UKRetailer, detect_retailer_from_url, estimate_uk_shipping
-from src.lego_bot.uk_finder import default_box_art_url, find_best_uk_offer, lookup_set_metadata
+from src.lego_bot.uk_finder import (
+    clean_set_display_name,
+    default_box_art_url,
+    find_best_uk_offer,
+    lookup_set_metadata,
+)
 from src.lego_bot.wishlist_store import load_wishlist_entries
 
 
@@ -25,8 +30,9 @@ def sync_wishlist_to_db(db: PriceDatabase, entries: list[dict[str, Any]]) -> lis
     synced: list[TrackedItem] = []
 
     for entry in entries:
-        name = str(entry["name"]).strip()
+        raw_name = str(entry["name"]).strip()
         set_number = str(entry["set_number"]).strip() if entry.get("set_number") else None
+        name = clean_set_display_name(raw_name, set_number) or raw_name
         url = str(entry.get("url") or "").strip() or None
         notify_ids = [str(u) for u in (entry.get("notify_user_ids") or [])]
 
@@ -233,12 +239,16 @@ async def run_once(*, test_mode: bool = False, force_weekly: bool = False) -> No
     has_prime = os.getenv("HAS_AMAZON_PRIME", "false").lower() == "true"
     prefer_cc = os.getenv("PREFER_CLICK_AND_COLLECT", "false").lower() == "true"
     brickset_key = os.getenv("BRICKSET_API_KEY", "").strip() or None
+    serpapi_key = os.getenv("SERPAPI_KEY", "").strip() or None
+    raw_serp_limit = os.getenv("SERPAPI_MONTHLY_LIMIT", "250").strip()
+    serp_limit = max(10, int(raw_serp_limit)) if raw_serp_limit.isdigit() else 250
 
     entries = load_wishlist_entries(wishlist_path)
     db = PriceDatabase(db_path)
 
     try:
         items = sync_wishlist_to_db(db, entries)
+        db.purge_implausible_history()
         if not items:
             print("Wishlist is empty.")
             return
@@ -305,6 +315,10 @@ async def run_once(*, test_mode: bool = False, force_weekly: bool = False) -> No
                     )
                     item = db.get_item(item.id) or item
 
+                can_serp = False
+                if serpapi_key:
+                    can_serp, _ = db.can_spend_token("serpapi", serp_limit, manual_force=False)
+
                 best_offer, notes = await find_best_uk_offer(
                     session,
                     name=item.name,
@@ -313,6 +327,9 @@ async def run_once(*, test_mode: bool = False, force_weekly: bool = False) -> No
                     rrp_gbp=rrp if rrp > 0 else None,
                     has_amazon_prime=has_prime,
                     prefer_click_and_collect=prefer_cc,
+                    serpapi_key=serpapi_key,
+                    allow_serpapi=can_serp,
+                    on_serpapi_credit_used=lambda: db.increment_monthly_usage("serpapi"),
                 )
                 if best_offer is None:
                     print(f"No in-stock UK offers found for {item.name}: {'; '.join(notes)}")

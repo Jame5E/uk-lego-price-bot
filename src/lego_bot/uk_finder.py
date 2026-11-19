@@ -4,16 +4,30 @@ import asyncio
 import json
 import re
 import time
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any, Callable
 from urllib.parse import quote_plus
 
 import aiohttp
 from bs4 import BeautifulSoup
 
+from .deal_filter import is_valid_lego_set_listing
 from .scraper import DEFAULT_HEADERS, fetch_price_for_url, parse_price_from_html
-from .shipping import UKRetailer, estimate_uk_shipping
+from .shipping import (
+    APPROVED_UK_RETAILERS,
+    UKRetailer,
+    estimate_uk_shipping,
+    match_approved_uk_retailer,
+)
+
+try:
+    from curl_cffi.requests import AsyncSession as CurlAsyncSession
+
+    HAS_CURL_CFFI = True
+except ImportError:  # pragma: no cover
+    CurlAsyncSession = None  # type: ignore[assignment]
+    HAS_CURL_CFFI = False
 
 OUT_OF_STOCK_PHRASES = (
     "out of stock",
@@ -23,8 +37,18 @@ OUT_OF_STOCK_PHRASES = (
     "no longer available",
 )
 
-# Per-source circuit breaker: skip sources that repeatedly return 403/202/429 or timeout
-_SOURCE_COOLDOWN_SECONDS = 1800.0
+GENERIC_BRICKSET_SUBTHEMES = {
+    "licensed",
+    "miscellaneous",
+    "seasonal",
+    "promotional",
+    "general",
+    "retail",
+    "special",
+}
+
+# Per-source circuit breaker for any direct store that returns repeated 403/429
+_SOURCE_COOLDOWN_SECONDS = 900.0
 _SOURCE_FAIL_STREAK: dict[str, int] = {}
 _SOURCE_COOLDOWN_UNTIL: dict[str, float] = {}
 
@@ -51,8 +75,8 @@ def _record_source_ok(source_key: str) -> None:
     _SOURCE_COOLDOWN_UNTIL.pop(source_key, None)
 
 
-# In-memory price cache (10 minutes) to avoid redundant scraping & proxy bandwidth
-_PRICE_CACHE_TTL_SECONDS = 600.0
+# In-memory price cache (30 minutes) to keep `/wishlist check` instant and save resources
+_PRICE_CACHE_TTL_SECONDS = 1800.0
 _PRICE_CACHE: dict[str, tuple[float, "UKOffer", list[str]]] = {}
 
 
@@ -110,86 +134,19 @@ def default_box_art_url(set_number: str | None) -> str | None:
     return f"https://images.brickset.com/sets/images/{clean}-1.jpg"
 
 
-async def lookup_set_metadata(
-    session: aiohttp.ClientSession,
-    set_number: str,
-    *,
-    brickset_api_key: str | None = None,
-    proxy_url: str | None = None,
-) -> SetMetadata:
-    """Auto-discover set name, category, UK RRP (£), box art image, and retiring status."""
-    clean_num = set_number.strip().split("-")[0]
-
-    if brickset_api_key:
-        meta = await _lookup_brickset(session, clean_num, brickset_api_key)
-        if meta.rrp_gbp is not None or meta.name is not None:
-            return meta
-
-    # Try Brickset public page first (has Theme/Category, Subtheme, RRP £, and Name)
-    public_meta = await _lookup_brickset_public(session, clean_num)
-
-    lego_url = build_lego_uk_product_url(public_meta.name, clean_num)
-    lego_meta: SetMetadata | None = None
-    if not public_meta.name or not public_meta.rrp_gbp or not public_meta.is_retiring:
-        try:
-            async with session.get(
-                lego_url, headers=DEFAULT_HEADERS, proxy=proxy_url, timeout=aiohttp.ClientTimeout(total=6)
-            ) as resp:
-                if resp.status == 200:
-                    html = await resp.text()
-                    soup = BeautifulSoup(html, "html.parser")
-                    try:
-                        quote = parse_price_from_html(html, lego_url)
-                        badge_text = " ".join(
-                            el.get_text(" ", strip=True).lower()
-                            for el in soup.find_all(["span", "div"], attrs={"data-test": re.compile("flag|badge|status", re.I)})
-                        )
-                        lower_html = html.lower()
-                        retiring = (
-                            "retiring soon" in badge_text
-                            or '"retiringsoon":true' in lower_html
-                            or '"availabilitytext":"retiring soon"' in lower_html
-                        )
-
-                        og_title = soup.find("meta", attrs={"property": "og:title"})
-                        og_image = soup.find("meta", attrs={"property": "og:image"})
-                        name = og_title["content"].split("|")[0].strip() if og_title and og_title.get("content") else None
-                        image_url = og_image["content"].strip() if og_image and og_image.get("content") else default_box_art_url(clean_num)
-
-                        if quote is not None or name is not None or retiring:
-                            lego_meta = SetMetadata(
-                                name=name,
-                                rrp_gbp=quote.price_gbp if quote else None,
-                                is_retiring=retiring,
-                                image_url=image_url,
-                                source="lego_uk",
-                            )
-                    finally:
-                        soup.decompose()
-        except Exception:
-            pass
-
-    if public_meta.name or public_meta.rrp_gbp or public_meta.is_retired:
-        return SetMetadata(
-            name=public_meta.name or (lego_meta.name if lego_meta else None),
-            rrp_gbp=public_meta.rrp_gbp or (lego_meta.rrp_gbp if lego_meta else None),
-            is_retiring=(public_meta.is_retiring or (lego_meta.is_retiring if lego_meta else False)) and not public_meta.is_retired,
-            image_url=public_meta.image_url or (lego_meta.image_url if lego_meta else default_box_art_url(clean_num)),
-            source=public_meta.source,
-            category=public_meta.category,
-            is_retired=public_meta.is_retired,
-        )
-
-    if lego_meta and (lego_meta.name or lego_meta.rrp_gbp is not None):
-        return lego_meta
-
-    return SetMetadata(
-        name=None,
-        rrp_gbp=None,
-        is_retiring=False,
-        image_url=default_box_art_url(clean_num),
-        source="fallback",
-    )
+def clean_set_display_name(name: str | None, set_number: str | None = None) -> str | None:
+    """Clean redundant set numbers or generic Brickset prefixes like 'Licensed: 42171 ...'."""
+    if not name:
+        return None
+    cleaned = name.strip()
+    if ":" in cleaned:
+        prefix, rest = cleaned.split(":", 1)
+        if prefix.strip().lower() in GENERIC_BRICKSET_SUBTHEMES:
+            cleaned = rest.strip()
+    if set_number:
+        clean_num = set_number.strip().split("-")[0]
+        cleaned = re.sub(rf"^(?:lego\s+)?#?{re.escape(clean_num)}(?:-\d+)?\s*[:\-–]?\s*", "", cleaned, flags=re.I)
+    return cleaned.strip() or name.strip()
 
 
 def _format_category(theme: str | None) -> str | None:
@@ -199,12 +156,15 @@ def _format_category(theme: str | None) -> str | None:
     return t if t.lower().startswith("lego ") else f"LEGO {t}"
 
 
-def _enrich_name_with_subtheme(name: str | None, subtheme: str | None) -> str | None:
-    if not name:
+def _enrich_name_with_subtheme(name: str | None, subtheme: str | None, set_number: str | None = None) -> str | None:
+    base = clean_set_display_name(name, set_number)
+    if not base:
         return None
-    if subtheme and subtheme.strip() and subtheme.strip().lower() not in name.lower():
-        return f"{subtheme.strip()}: {name}"
-    return name
+    if subtheme and subtheme.strip():
+        sub = subtheme.strip()
+        if sub.lower() not in GENERIC_BRICKSET_SUBTHEMES and sub.lower() not in base.lower():
+            return f"{sub}: {base}"
+    return base
 
 
 def _parse_exit_date_status(exit_date_text: str) -> tuple[bool, bool]:
@@ -226,16 +186,77 @@ def _parse_exit_date_status(exit_date_text: str) -> tuple[bool, bool]:
     return False, False
 
 
+async def _http_get_html(
+    session: aiohttp.ClientSession | None,
+    url: str,
+    *,
+    cookies: dict[str, str] | None = None,
+    timeout_seconds: float = 10.0,
+) -> tuple[int, str]:
+    """Fetch HTML using Chrome TLS impersonation (curl_cffi) when available, else aiohttp."""
+    if HAS_CURL_CFFI and CurlAsyncSession is not None:
+        async with CurlAsyncSession(impersonate="chrome") as csession:
+            resp = await csession.get(
+                url,
+                cookies=cookies,
+                timeout=timeout_seconds,
+                allow_redirects=True,
+            )
+            return int(resp.status_code), str(resp.text)
+
+    if session is None:
+        raise RuntimeError("No HTTP session available")
+    merged_headers = {
+        **DEFAULT_HEADERS,
+        "Accept-Language": "en-GB,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    async with session.get(
+        url,
+        headers=merged_headers,
+        cookies=cookies,
+        timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+    ) as resp:
+        return resp.status, await resp.text()
+
+
+async def lookup_set_metadata(
+    session: aiohttp.ClientSession,
+    set_number: str,
+    *,
+    brickset_api_key: str | None = None,
+    proxy_url: str | None = None,
+) -> SetMetadata:
+    """Auto-discover set name, category, UK RRP (£), box art image, and retiring status."""
+    clean_num = set_number.strip().split("-")[0]
+
+    if brickset_api_key:
+        meta = await _lookup_brickset(session, clean_num, brickset_api_key)
+        if meta.rrp_gbp is not None or meta.name is not None:
+            return meta
+
+    public_meta = await _lookup_brickset_public(session, clean_num)
+    if public_meta.name or public_meta.rrp_gbp or public_meta.is_retired:
+        return public_meta
+
+    return SetMetadata(
+        name=None,
+        rrp_gbp=None,
+        is_retiring=False,
+        image_url=default_box_art_url(clean_num),
+        source="fallback",
+    )
+
+
 async def _lookup_brickset_public(
     session: aiohttp.ClientSession,
     set_number: str,
 ) -> SetMetadata:
     url = f"https://brickset.com/sets/{set_number}-1"
     try:
-        async with session.get(url, headers=DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status != 200:
-                return SetMetadata(None, None, False, default_box_art_url(set_number), "brickset_web_err")
-            html = await resp.text()
+        status, html = await _http_get_html(session, url, timeout_seconds=10.0)
+        if status != 200:
+            return SetMetadata(None, None, False, default_box_art_url(set_number), "brickset_web_err")
     except Exception:
         return SetMetadata(None, None, False, default_box_art_url(set_number), "brickset_web_err")
 
@@ -244,10 +265,7 @@ async def _lookup_brickset_public(
     h1 = soup.find("h1")
     if h1:
         raw_title = h1.get_text(" ", strip=True)
-        if ":" in raw_title and raw_title.split(":", 1)[0].strip().startswith(set_number):
-            name = raw_title.split(":", 1)[1].strip()
-        else:
-            name = raw_title
+        name = clean_set_display_name(raw_title, set_number)
 
     theme: str | None = None
     subtheme: str | None = None
@@ -266,15 +284,16 @@ async def _lookup_brickset_public(
             subtheme = val
         elif label in ("availability", "notes"):
             availability_val += " " + val.lower()
-        elif label == "exit date":
+        elif label in ("exit date", "launch/exit"):
             availability_val += " " + val.lower()
-            r_soon, r_done = _parse_exit_date_status(val)
+            exit_part = val.split("-")[-1].strip() if "-" in val else val
+            r_soon, r_done = _parse_exit_date_status(exit_part)
             if r_soon:
                 exit_date_retiring = True
             if r_done:
                 exit_date_retired = True
 
-    name = _enrich_name_with_subtheme(name, subtheme)
+    name = _enrich_name_with_subtheme(name, subtheme, set_number)
     category = _format_category(theme)
 
     text = soup.get_text(" ", strip=True)
@@ -327,15 +346,18 @@ async def _lookup_brickset(
     rrp = uk_data.get("retailPrice")
     exit_date_str = uk_data.get("dateLastAvailable") or s.get("exitDate")
     image_url = s.get("image", {}).get("imageURL") or default_box_art_url(set_number)
-    enriched_name = _enrich_name_with_subtheme(s.get("name"), s.get("subtheme"))
+    enriched_name = _enrich_name_with_subtheme(s.get("name"), s.get("subtheme"), set_number)
     category = _format_category(s.get("theme"))
 
     is_retiring = False
+    is_retired = False
     if exit_date_str:
         try:
             exit_dt = datetime.fromisoformat(str(exit_date_str).replace("Z", "+00:00"))
             days_left = (exit_dt - datetime.now(timezone.utc)).days
-            if days_left <= 180:
+            if days_left < 0:
+                is_retired = True
+            elif days_left <= 180:
                 is_retiring = True
         except ValueError:
             pass
@@ -347,6 +369,7 @@ async def _lookup_brickset(
         image_url=image_url,
         source="brickset",
         category=category,
+        is_retired=is_retired,
     )
 
 
@@ -355,13 +378,9 @@ def build_lego_uk_product_url(name: str | None, set_number: str) -> str:
     clean_num = set_number.strip().split("-")[0]
     if not name or name.strip().startswith("LEGO Set #"):
         return f"https://www.lego.com/en-gb/product/{clean_num}"
-    cleaned = name.strip()
-    if ":" in cleaned and clean_num in cleaned.split(":", 1)[0]:
-        cleaned = cleaned.split(":", 1)[1].strip()
-    elif ":" in cleaned and len(cleaned.split(":", 1)[0]) < 24:
-        cleaned = cleaned.split(":", 1)[1].strip()
-    cleaned = re.sub(r"^lego\s+", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(rf"^(?:#?\s*{re.escape(clean_num)}\s*[-–:]?\s*)", "", cleaned)
+    cleaned = clean_set_display_name(name, clean_num) or name.strip()
+    cleaned = re.sub(r"^lego\s+(?:icons|technic|star\s+wars|ideas|creator|city|marvel|harry\s+potter|disney)\s+", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"^lego\s+", "", cleaned, flags=re.I)
     slug = re.sub(r"[^a-z0-9]+", "-", cleaned.lower()).strip("-")
     if not slug or slug == clean_num:
         return f"https://www.lego.com/en-gb/product/{clean_num}"
@@ -371,15 +390,22 @@ def build_lego_uk_product_url(name: str | None, set_number: str) -> str:
 
 
 def build_uk_search_urls(name: str, set_number: str | None) -> list[tuple[UKRetailer, str]]:
-    """Build candidate UK retailer URLs for a LEGO set number."""
+    """Build candidate search URLs across the 8 approved UK online retailers."""
     query = quote_plus(f"LEGO {set_number}" if set_number else name)
-    urls: list[tuple[UKRetailer, str]] = []
+    clean_num = set_number.strip().split("-")[0] if set_number else ""
+    urls: list[tuple[UKRetailer, str]] = [
+        (UKRetailer.AMAZON_UK, f"https://www.amazon.co.uk/s?k={query}"),
+    ]
     if set_number:
         urls.append((UKRetailer.LEGO_UK, build_lego_uk_product_url(name, set_number)))
+        urls.append((UKRetailer.ARGOS, f"https://www.argos.co.uk/search/lego-{clean_num}/"))
     urls.extend(
         [
-            (UKRetailer.SMYTHS, f"https://www.smythstoys.com/uk/en-gb/search/?text={query}"),
             (UKRetailer.JOHN_LEWIS, f"https://www.johnlewis.com/search?search-term={query}"),
+            (UKRetailer.SMYTHS, f"https://www.smythstoys.com/uk/en-gb/search/?text={query}"),
+            (UKRetailer.CURRYS, f"https://www.currys.co.uk/search?q={query}"),
+            (UKRetailer.ENTERTAINER, f"https://www.thetoyshop.com/search?q={query}"),
+            (UKRetailer.DISNEY_STORE, f"https://www.disneystore.co.uk/search?q={query}"),
         ]
     )
     return urls
@@ -440,413 +466,369 @@ def extract_first_gbp_price_from_search(html: str, set_number: str | None) -> fl
         soup.decompose()
 
 
-async def _fetch_brickwatch_uk(
-    session: aiohttp.ClientSession,
+# --- Layer 1: Zero-Token Direct UK Retailer Parsers ---
+
+
+def parse_amazon_uk_search_html(
+    html: str,
     set_number: str,
     *,
+    rrp_gbp: float | None = None,
     has_amazon_prime: bool = False,
-    prefer_click_and_collect: bool = False,
-    proxy_url: str | None = None,
-) -> tuple[list[UKOffer], str | None]:
-    """Query BrickWatch UK aggregator for current in-stock UK retailer prices."""
-    if _is_source_cooled_down("brickwatch_uk"):
-        return [], "BrickWatch UK: temporarily skipped (cooldown)"
-
+) -> list[UKOffer]:
+    """Parse Amazon UK search HTML for genuine brand-new LEGO set offers."""
     clean_num = set_number.strip().split("-")[0]
-    url = f"https://www.brickwatch.net/en-GB/set/{clean_num}/"
-    html: str | None = None
-    last_err: str = "BrickWatch UK: unknown error"
-    attempts: list[tuple[str | None, int]] = [(None, 10)]
-    if proxy_url:
-        attempts.append((proxy_url, 20))
-    else:
-        attempts.append((None, 15))
-
-    for attempt_proxy, attempt_timeout in attempts:
-        try:
-            async with session.get(
-                url,
-                headers=DEFAULT_HEADERS,
-                proxy=attempt_proxy,
-                timeout=aiohttp.ClientTimeout(total=attempt_timeout),
-            ) as resp:
-                if resp.status == 200:
-                    html = await resp.text()
-                    break
-                last_err = f"BrickWatch UK: HTTP {resp.status}"
-                if resp.status not in (202, 403, 429, 503):
-                    return [], last_err
-        except Exception as exc:
-            last_err = f"BrickWatch UK: {type(exc).__name__}"
-
-    if html is None:
-        _record_source_block("brickwatch_uk")
-        return [], last_err
-
-    _record_source_ok("brickwatch_uk")
-    if "£" not in html:
-        return [], "BrickWatch UK: no active GBP offers found"
+    if clean_num not in html or "s-search-result" not in html:
+        return []
 
     soup = BeautifulSoup(html, "html.parser")
     try:
-        text = soup.get_text(" ", strip=True)
-        offers: list[UKOffer] = []
-
-        retailer_map = {
-            "amazon": UKRetailer.AMAZON_UK,
-            "argos": UKRetailer.ARGOS,
-            "lego": UKRetailer.LEGO_UK,
-            "smyths": UKRetailer.SMYTHS,
-            "john lewis": UKRetailer.JOHN_LEWIS,
-        }
-
-        for row in soup.find_all(["tr", "div", "li"]):
-            row_text = row.get_text(" ", strip=True)
-            if "£" not in row_text or len(row_text) > 220:
-                continue
-            lower = row_text.lower()
-            if any(phrase in lower for phrase in OUT_OF_STOCK_PHRASES):
-                continue
-            matched_retailer = None
-            for kw, ret in retailer_map.items():
-                if kw in lower:
-                    matched_retailer = ret
-                    break
-            if matched_retailer is None:
-                continue
-            m = re.search(r"£\s*(\d{1,4}(?:\.\d{2})?)", row_text)
-            if not m:
-                continue
-            price = round(float(m.group(1)), 2)
-            if price <= 0:
-                continue
-            ship = estimate_uk_shipping(
-                price,
-                matched_retailer,
-                has_amazon_prime=has_amazon_prime,
-                prefer_click_and_collect=prefer_click_and_collect,
-            )
-            offers.append(
-                UKOffer(
-                    retailer=matched_retailer,
-                    url=url,
-                    item_price_gbp=price,
-                    shipping_gbp=ship.shipping_gbp,
-                    total_gbp=ship.total_gbp,
-                    shipping_note=ship.note,
-                )
-            )
-
-        if not offers and "£" in text:
-            m = re.search(r"£\s*(\d{1,4}\.\d{2})", text)
-            if m:
-                price = round(float(m.group(1)), 2)
-                ship = estimate_uk_shipping(price, UKRetailer.OTHER)
-                offers.append(
-                    UKOffer(
-                        retailer=UKRetailer.OTHER,
-                        url=url,
-                        item_price_gbp=price,
-                        shipping_gbp=ship.shipping_gbp,
-                        total_gbp=ship.total_gbp,
-                        shipping_note=ship.note,
-                    )
-                )
-
-        return offers, (None if offers else "BrickWatch UK: no active GBP offers found")
-    finally:
-        soup.decompose()
-
-
-async def _fetch_brickset_uk_offers(
-    session: aiohttp.ClientSession,
-    set_number: str,
-    *,
-    has_amazon_prime: bool = False,
-    prefer_click_and_collect: bool = False,
-) -> tuple[list[UKOffer], str | None]:
-    """Extract UK retailer prices (e.g. Amazon UK, LEGO.com, Zavvi) from Brickset set page."""
-    if _is_source_cooled_down("brickset_uk"):
-        return [], "Brickset UK: temporarily skipped (rate-limit cooldown)"
-
-    clean_num = set_number.strip().split("-")[0]
-    url = f"https://brickset.com/sets/{clean_num}-1"
-    try:
-        async with session.get(url, headers=DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-            if resp.status != 200:
-                if resp.status in (403, 429, 503):
-                    _record_source_block("brickset_uk")
-                return [], f"Brickset UK: HTTP {resp.status}"
-            html = await resp.text()
-    except Exception as exc:
-        _record_source_block("brickset_uk")
-        return [], f"Brickset UK: {type(exc).__name__}"
-
-    _record_source_ok("brickset_uk")
-
-    if "£" not in html:
-        return [], "Brickset UK: no live retailer prices listed"
-
-    soup = BeautifulSoup(html, "html.parser")
-    try:
-        offers: list[UKOffer] = []
-        retailer_map = {
-            "amazon.co.uk": UKRetailer.AMAZON_UK,
-            "amazon uk": UKRetailer.AMAZON_UK,
-            "lego.com": UKRetailer.LEGO_UK,
-            "argos": UKRetailer.ARGOS,
-            "smyths": UKRetailer.SMYTHS,
-            "john lewis": UKRetailer.JOHN_LEWIS,
-        }
-
-        for node in soup.find_all(["tr", "li", "div", "a"]):
-            txt = node.get_text(" ", strip=True)
-            if "£" not in txt or len(txt) > 160:
-                continue
-            lower = txt.lower()
-            if any(p in lower for p in OUT_OF_STOCK_PHRASES) or "rrp" in lower:
-                continue
-            matched = None
-            for kw, ret in retailer_map.items():
-                if kw in lower:
-                    matched = ret
-                    break
-            if matched is None:
-                continue
-            m = re.search(r"£\s*(\d{1,4}\.\d{2})", txt)
-            if not m:
-                continue
-            price = round(float(m.group(1)), 2)
-            if price <= 0:
-                continue
-            ship = estimate_uk_shipping(
-                price,
-                matched,
-                has_amazon_prime=has_amazon_prime,
-                prefer_click_and_collect=prefer_click_and_collect,
-            )
-            offers.append(
-                UKOffer(
-                    retailer=matched,
-                    url=url,
-                    item_price_gbp=price,
-                    shipping_gbp=ship.shipping_gbp,
-                    total_gbp=ship.total_gbp,
-                    shipping_note=ship.note,
-                )
-            )
-
-        return offers, (None if offers else "Brickset UK: no live retailer prices listed")
-    finally:
-        soup.decompose()
-
-
-async def _fetch_pricerunner_uk(
-    session: aiohttp.ClientSession,
-    set_number: str,
-    *,
-    proxy_url: str | None = None,
-) -> tuple[list[UKOffer], str | None]:
-    """Query PriceRunner UK search for GBP LEGO prices."""
-    if _is_source_cooled_down("pricerunner_uk"):
-        return [], "PriceRunner UK: temporarily skipped (cooldown)"
-
-    clean_num = set_number.strip().split("-")[0]
-    url = f"https://www.pricerunner.com/results?q=lego+{clean_num}"
-    try:
-        async with session.get(url, headers=DEFAULT_HEADERS, proxy=proxy_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-            if resp.status != 200:
-                if resp.status in (202, 403, 429, 503):
-                    _record_source_block("pricerunner_uk")
-                return [], f"PriceRunner UK: HTTP {resp.status}"
-            html = await resp.text()
-    except Exception as exc:
-        _record_source_block("pricerunner_uk")
-        return [], f"PriceRunner UK: {type(exc).__name__}"
-
-    _record_source_ok("pricerunner_uk")
-    price = extract_first_gbp_price_from_search(html, clean_num)
-    if price is None:
-        return [], "PriceRunner UK: no matching GBP price found"
-    ship = estimate_uk_shipping(price, UKRetailer.OTHER)
-    return [
-        UKOffer(
-            retailer=UKRetailer.OTHER,
-            url=url,
-            item_price_gbp=price,
-            shipping_gbp=ship.shipping_gbp,
-            total_gbp=ship.total_gbp,
-            shipping_note=ship.note,
+        loc_el = soup.find(id="glow-ingress-line2")
+        loc_text = loc_el.get_text(" ", strip=True).lower() if loc_el else ""
+        # If Amazon rendered export ex-VAT prices due to a non-UK server IP, restore 20% UK VAT
+        ex_vat_export = bool(loc_text) and not any(
+            uk_kw in loc_text for uk_kw in ("united kingdom", "select your address", "update location", "uk")
         )
-    ], None
+
+        offers: list[UKOffer] = []
+        for card in soup.find_all("div", attrs={"data-component-type": "s-search-result"})[:8]:
+            asin = str(card.get("data-asin") or "").strip()
+            if not asin:
+                continue
+            card_text = card.get_text(" ", strip=True)
+            if any(p in card_text.lower() for p in OUT_OF_STOCK_PHRASES):
+                continue
+
+            title_recipe = card.find("div", attrs={"data-cy": "title-recipe"})
+            h2 = card.find("h2")
+            if title_recipe:
+                title = title_recipe.get_text(" ", strip=True)
+            elif h2:
+                title = h2.get_text(" ", strip=True)
+            else:
+                title = card_text
+            if len(title) < 12 or clean_num not in title:
+                title = card_text[:280]
+
+            price_spans = card.select("span.a-price:not([data-a-strike]) > span.a-offscreen")
+            if not price_spans:
+                continue
+            raw_price = price_spans[0].get_text(strip=True)
+            m = re.search(r"£\s*(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)", raw_price)
+            if not m:
+                continue
+            price = float(m.group(1).replace(",", ""))
+            if ex_vat_export:
+                price = round(price * 1.20, 2)
+            else:
+                price = round(price, 2)
+
+            if not is_valid_lego_set_listing(title, clean_num, price, rrp_gbp):
+                continue
+
+            ship = estimate_uk_shipping(price, UKRetailer.AMAZON_UK, has_amazon_prime=has_amazon_prime)
+            offers.append(
+                UKOffer(
+                    retailer=UKRetailer.AMAZON_UK,
+                    url=f"https://www.amazon.co.uk/dp/{asin}",
+                    item_price_gbp=price,
+                    shipping_gbp=ship.shipping_gbp,
+                    total_gbp=ship.total_gbp,
+                    shipping_note=ship.note,
+                )
+            )
+        return offers
+    finally:
+        soup.decompose()
 
 
-async def _fetch_comparison_site_uk(
-    session: aiohttp.ClientSession,
+def parse_john_lewis_search_html(
+    html: str,
+    set_number: str,
+    *,
+    rrp_gbp: float | None = None,
+    prefer_click_and_collect: bool = False,
+) -> list[UKOffer]:
+    clean_num = set_number.strip().split("-")[0]
+    if clean_num not in html or "£" not in html:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    try:
+        offers: list[UKOffer] = []
+        for article in soup.find_all("article")[:10]:
+            text = article.get_text(" ", strip=True)
+            if clean_num not in text or "£" not in text:
+                continue
+            if any(p in text.lower() for p in OUT_OF_STOCK_PHRASES):
+                continue
+            m = re.search(r"£\s*(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)", text)
+            if not m:
+                continue
+            price = round(float(m.group(1).replace(",", "")), 2)
+            if not is_valid_lego_set_listing(text, clean_num, price, rrp_gbp):
+                continue
+            link_tag = article.find("a", href=True)
+            href = str(link_tag["href"]).strip() if link_tag else ""
+            if href.startswith("/"):
+                href = f"https://www.johnlewis.com{href}"
+            url = href if href.startswith("http") else f"https://www.johnlewis.com/search?search-term=lego+{clean_num}"
+            ship = estimate_uk_shipping(price, UKRetailer.JOHN_LEWIS, prefer_click_and_collect=prefer_click_and_collect)
+            offers.append(
+                UKOffer(
+                    retailer=UKRetailer.JOHN_LEWIS,
+                    url=url,
+                    item_price_gbp=price,
+                    shipping_gbp=ship.shipping_gbp,
+                    total_gbp=ship.total_gbp,
+                    shipping_note=ship.note,
+                )
+            )
+        return offers
+    finally:
+        soup.decompose()
+
+
+def parse_argos_search_html(
+    html: str,
+    set_number: str,
+    *,
+    rrp_gbp: float | None = None,
+    prefer_click_and_collect: bool = False,
+) -> list[UKOffer]:
+    clean_num = set_number.strip().split("-")[0]
+    if clean_num not in html or "£" not in html:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    try:
+        offers: list[UKOffer] = []
+        seen_urls: set[str] = set()
+        for card in soup.find_all("div", attrs={"data-test": re.compile("component-product-card")})[:10]:
+            text = card.get_text(" ", strip=True)
+            if clean_num not in text or "£" not in text:
+                continue
+            if any(p in text.lower() for p in OUT_OF_STOCK_PHRASES):
+                continue
+            # Strip monthly finance text ("from £7.63 per month") before matching item price
+            cleaned_text = re.sub(r"from\s*£\s*\d+(?:\.\d{2})?\s*per\s*month", "", text, flags=re.I)
+            m = re.search(r"£\s*(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)", cleaned_text)
+            if not m:
+                continue
+            price = round(float(m.group(1).replace(",", "")), 2)
+            if not is_valid_lego_set_listing(cleaned_text, clean_num, price, rrp_gbp):
+                continue
+            link_tag = card.find("a", href=re.compile(r"^/product/\d+")) or card.find("a", href=True)
+            href = str(link_tag["href"]).strip() if link_tag else ""
+            if href.startswith("/"):
+                href = f"https://www.argos.co.uk{href}"
+            url = href if href.startswith("http") else f"https://www.argos.co.uk/search/lego-{clean_num}/"
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            ship = estimate_uk_shipping(price, UKRetailer.ARGOS, prefer_click_and_collect=prefer_click_and_collect)
+            offers.append(
+                UKOffer(
+                    retailer=UKRetailer.ARGOS,
+                    url=url,
+                    item_price_gbp=price,
+                    shipping_gbp=ship.shipping_gbp,
+                    total_gbp=ship.total_gbp,
+                    shipping_note=ship.note,
+                )
+            )
+        return offers
+    finally:
+        soup.decompose()
+
+
+def parse_disney_store_search_html(
+    html: str,
+    set_number: str,
+    *,
+    rrp_gbp: float | None = None,
+) -> list[UKOffer]:
+    clean_num = set_number.strip().split("-")[0]
+    if clean_num not in html or "£" not in html:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    try:
+        offers: list[UKOffer] = []
+        for tile in soup.select("div.product, div.product-tile")[:10]:
+            text = tile.get_text(" ", strip=True)
+            if clean_num not in text or "£" not in text:
+                continue
+            if any(p in text.lower() for p in OUT_OF_STOCK_PHRASES):
+                continue
+            m = re.search(r"£\s*(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)", text)
+            if not m:
+                continue
+            price = round(float(m.group(1).replace(",", "")), 2)
+            if not is_valid_lego_set_listing(text, clean_num, price, rrp_gbp):
+                continue
+            link_tag = tile.find("a", href=True)
+            href = str(link_tag["href"]).strip() if link_tag else ""
+            if href.startswith("/"):
+                href = f"https://www.disneystore.co.uk{href}"
+            url = href.split("?")[0] if href.startswith("http") else f"https://www.disneystore.co.uk/search?q=lego+{clean_num}"
+            ship = estimate_uk_shipping(price, UKRetailer.DISNEY_STORE)
+            offers.append(
+                UKOffer(
+                    retailer=UKRetailer.DISNEY_STORE,
+                    url=url,
+                    item_price_gbp=price,
+                    shipping_gbp=ship.shipping_gbp,
+                    total_gbp=ship.total_gbp,
+                    shipping_note=ship.note,
+                )
+            )
+        return offers
+    finally:
+        soup.decompose()
+
+
+async def _fetch_direct_uk_store(
+    session: aiohttp.ClientSession | None,
     *,
     source_key: str,
     label: str,
     url: str,
-    set_number: str,
-    proxy_url: str | None = None,
+    parser_fn: Callable[[str], list[UKOffer]],
+    cookies: dict[str, str] | None = None,
 ) -> tuple[list[UKOffer], str | None]:
-    """Query a UK price-comparison search page with direct-then-proxy retry."""
     if _is_source_cooled_down(source_key):
-        return [], f"{label}: temporarily skipped (cooldown)"
-
-    clean_num = set_number.strip().split("-")[0]
-    html: str | None = None
-    last_err = f"{label}: unknown error"
-    attempts: list[tuple[str | None, int]] = [(None, 10)]
-    if proxy_url:
-        attempts.append((proxy_url, 15))
-
-    for attempt_proxy, attempt_timeout in attempts:
-        try:
-            async with session.get(
-                url,
-                headers=DEFAULT_HEADERS,
-                proxy=attempt_proxy,
-                timeout=aiohttp.ClientTimeout(total=attempt_timeout),
-            ) as resp:
-                if resp.status == 200:
-                    html = await resp.text()
-                    break
-                last_err = f"{label}: HTTP {resp.status}"
-                if resp.status not in (202, 403, 429, 503):
-                    return [], last_err
-        except Exception as exc:
-            last_err = f"{label}: {type(exc).__name__}"
-
-    if html is None:
-        _record_source_block(source_key)
-        return [], last_err
-
-    _record_source_ok(source_key)
-    price = extract_first_gbp_price_from_search(html, clean_num)
-    if price is None:
-        return [], f"{label}: no matching GBP price found"
-    ship = estimate_uk_shipping(price, UKRetailer.OTHER)
-    return [
-        UKOffer(
-            retailer=UKRetailer.OTHER,
-            url=url,
-            item_price_gbp=price,
-            shipping_gbp=ship.shipping_gbp,
-            total_gbp=ship.total_gbp,
-            shipping_note=ship.note,
-        )
-    ], None
-
-
-async def _fetch_pricespy_uk(
-    session: aiohttp.ClientSession,
-    set_number: str,
-    *,
-    proxy_url: str | None = None,
-) -> tuple[list[UKOffer], str | None]:
-    clean_num = set_number.strip().split("-")[0]
-    return await _fetch_comparison_site_uk(
-        session,
-        source_key="pricespy_uk",
-        label="PriceSpy UK",
-        url=f"https://pricespy.co.uk/search?search=lego+{clean_num}",
-        set_number=clean_num,
-        proxy_url=proxy_url,
-    )
-
-
-async def _fetch_idealo_uk(
-    session: aiohttp.ClientSession,
-    set_number: str,
-    *,
-    proxy_url: str | None = None,
-) -> tuple[list[UKOffer], str | None]:
-    clean_num = set_number.strip().split("-")[0]
-    return await _fetch_comparison_site_uk(
-        session,
-        source_key="idealo_uk",
-        label="idealo UK",
-        url=f"https://www.idealo.co.uk/mscat.html?q=lego+{clean_num}",
-        set_number=clean_num,
-        proxy_url=proxy_url,
-    )
-
-
-async def _check_retailer_url(
-    session: aiohttp.ClientSession,
-    retailer: UKRetailer,
-    url: str,
-    *,
-    set_number: str | None,
-    has_amazon_prime: bool,
-    prefer_click_and_collect: bool,
-    proxy_url: str | None = None,
-) -> tuple[list[UKOffer], str | None]:
-    source_key = f"retailer_{retailer.value}"
-    if _is_source_cooled_down(source_key):
-        return [], f"{retailer.display_name}: temporarily skipped (cooldown)"
-
-    if retailer == UKRetailer.LEGO_UK:
-        res = await fetch_price_for_url(session, url, proxy_url=proxy_url)
-        if res.ok and res.quote is not None:
-            _record_source_ok(source_key)
-            if not res.quote.in_stock:
-                return [], "LEGO.com UK: out of stock"
-            ship = estimate_uk_shipping(
-                res.quote.price_gbp,
-                retailer,
-                has_amazon_prime=has_amazon_prime,
-                prefer_click_and_collect=prefer_click_and_collect,
-            )
-            return [
-                UKOffer(
-                    retailer=retailer,
-                    url=url,
-                    item_price_gbp=res.quote.price_gbp,
-                    shipping_gbp=ship.shipping_gbp,
-                    total_gbp=ship.total_gbp,
-                    shipping_note=ship.note,
-                )
-            ], None
-        if res.error and ("403" in res.error or "429" in res.error or "blocked" in res.error.lower()):
-            _record_source_block(source_key)
-        return [], f"{retailer.display_name}: {res.error}"
-
+        return [], f"{label}: skipped (cooldown)"
     try:
-        async with session.get(
-            url, headers=DEFAULT_HEADERS, proxy=proxy_url, timeout=aiohttp.ClientTimeout(total=8)
-        ) as resp:
-            if resp.status != 200:
-                if resp.status in (202, 403, 429, 503):
-                    _record_source_block(source_key)
-                return [], f"{retailer.display_name}: HTTP {resp.status}"
-            html = await resp.text()
+        status, html = await _http_get_html(session, url, cookies=cookies, timeout_seconds=10.0)
+        if status != 200:
+            if status in (202, 403, 429, 503):
+                _record_source_block(source_key)
+            return [], f"{label}: HTTP {status}"
+        if "validateCaptcha" in html:
+            _record_source_block(source_key)
+            return [], f"{label}: rate-limited"
     except Exception as exc:
         _record_source_block(source_key)
-        return [], f"{retailer.display_name}: {type(exc).__name__}"
+        return [], f"{label}: {type(exc).__name__}"
 
     _record_source_ok(source_key)
-    price = extract_first_gbp_price_from_search(html, set_number)
-    if price is None:
-        return [], f"{retailer.display_name}: no price found"
+    found = parser_fn(html)
+    return found, (None if found else f"{label}: not in stock / not listed")
 
-    ship = estimate_uk_shipping(
-        price,
-        retailer,
+
+# --- Layer 2: SerpApi Google Shopping UK (Covers all 8 Approved UK Stores) ---
+
+
+def parse_serpapi_shopping_payload(
+    payload: dict[str, Any],
+    set_number: str,
+    *,
+    rrp_gbp: float | None = None,
+    has_amazon_prime: bool = False,
+    prefer_click_and_collect: bool = False,
+) -> list[UKOffer]:
+    """Extract offers strictly from the 8 approved UK retailers in a SerpApi Google Shopping UK response."""
+    clean_num = set_number.strip().split("-")[0]
+    offers: list[UKOffer] = []
+
+    for item in payload.get("shopping_results") or []:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        source = str(item.get("source") or "").strip()
+        link = str(item.get("product_link") or item.get("link") or "").strip()
+
+        retailer = match_approved_uk_retailer(source) or match_approved_uk_retailer(link)
+        if retailer is None or retailer not in APPROVED_UK_RETAILERS:
+            continue
+
+        # Reject explicitly second-hand / refurbished condition tags from Google Shopping
+        second_hand = str(item.get("second_hand_condition") or "").strip().lower()
+        if second_hand:
+            continue
+
+        extracted = item.get("extracted_price")
+        price: float | None = None
+        if isinstance(extracted, (int, float)) and extracted > 0:
+            price_str = str(item.get("price") or "£")
+            if "£" in price_str or "gbp" in price_str.lower():
+                price = round(float(extracted), 2)
+        if price is None:
+            m = re.search(r"£\s*(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)", str(item.get("price") or ""))
+            if m:
+                price = round(float(m.group(1).replace(",", "")), 2)
+
+        if price is None or not is_valid_lego_set_listing(title, clean_num, price, rrp_gbp):
+            continue
+
+        delivery_str = str(item.get("delivery") or "").strip() or None
+        ship = estimate_uk_shipping(
+            price,
+            retailer,
+            has_amazon_prime=has_amazon_prime,
+            prefer_click_and_collect=prefer_click_and_collect,
+            explicit_delivery_text=delivery_str,
+        )
+        offers.append(
+            UKOffer(
+                retailer=retailer,
+                url=link or f"https://www.google.co.uk/search?tbm=shop&q=LEGO+{clean_num}",
+                item_price_gbp=price,
+                shipping_gbp=ship.shipping_gbp,
+                total_gbp=ship.total_gbp,
+                shipping_note=ship.note,
+            )
+        )
+
+    return offers
+
+
+async def _fetch_serpapi_google_shopping_uk(
+    session: aiohttp.ClientSession,
+    set_number: str,
+    api_key: str,
+    *,
+    rrp_gbp: float | None = None,
+    has_amazon_prime: bool = False,
+    prefer_click_and_collect: bool = False,
+    on_credit_used: Callable[[], None] | None = None,
+) -> tuple[list[UKOffer], str | None]:
+    clean_num = set_number.strip().split("-")[0]
+    url = "https://serpapi.com/search.json"
+    params = {
+        "engine": "google_shopping",
+        "q": f"LEGO {clean_num}",
+        "gl": "uk",
+        "hl": "en",
+        "location": "United Kingdom",
+        "api_key": api_key,
+    }
+    try:
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                return [], f"Google Shopping UK (SerpApi): HTTP {resp.status}"
+            payload = await resp.json()
+    except Exception as exc:
+        return [], f"Google Shopping UK (SerpApi): {type(exc).__name__}"
+
+    if "error" in payload:
+        return [], f"Google Shopping UK: {payload['error']}"
+
+    # SerpApi cached responses are free (0 credits charged)
+    meta_status = str((payload.get("search_metadata") or {}).get("status") or "")
+    was_cached = bool((payload.get("search_parameters") or {}).get("cached")) or "cached" in meta_status.lower()
+    if not was_cached and on_credit_used is not None:
+        on_credit_used()
+
+    offers = parse_serpapi_shopping_payload(
+        payload,
+        clean_num,
+        rrp_gbp=rrp_gbp,
         has_amazon_prime=has_amazon_prime,
         prefer_click_and_collect=prefer_click_and_collect,
     )
-    return [
-        UKOffer(
-            retailer=retailer,
-            url=url,
-            item_price_gbp=price,
-            shipping_gbp=ship.shipping_gbp,
-            total_gbp=ship.total_gbp,
-            shipping_note=ship.note,
-        )
-    ], None
+    return offers, (None if offers else "Google Shopping UK: no approved UK retailer offer found")
 
 
 async def find_best_uk_offer(
@@ -858,57 +840,94 @@ async def find_best_uk_offer(
     rrp_gbp: float | None = None,
     has_amazon_prime: bool = False,
     prefer_click_and_collect: bool = False,
+    serpapi_key: str | None = None,
+    allow_serpapi: bool = True,
+    on_serpapi_credit_used: Callable[[], None] | None = None,
     proxy_url: str | None = None,
     force_refresh: bool = False,
 ) -> tuple[UKOffer | None, list[str]]:
-    """Check direct URL or multiple UK retailers concurrently and return the cheapest in-stock landed offer."""
+    """Check approved UK retailers concurrently (0-token direct stores + quota-governed Google Shopping UK)
+    and return the cheapest genuine in-stock landed GBP offer."""
     clean_key_id = set_number.strip().split("-")[0] if set_number else name.strip().lower()
     cache_key = f"{clean_key_id}|{int(has_amazon_prime)}|{int(prefer_click_and_collect)}|{direct_url or ''}"
     now = time.monotonic()
     if not force_refresh and cache_key in _PRICE_CACHE:
         cached_at, cached_offer, cached_notes = _PRICE_CACHE[cache_key]
         if now - cached_at < _PRICE_CACHE_TTL_SECONDS:
-            return cached_offer, [*cached_notes, "Served from 10m in-memory cache"]
+            return cached_offer, [*cached_notes, "Served from 30m cache"]
         _PRICE_CACHE.pop(cache_key, None)
 
     offers: list[UKOffer] = []
     notes: list[str] = []
-
-    def _is_plausible_price(offer: UKOffer) -> bool:
-        if rrp_gbp is None or rrp_gbp <= 0:
-            return offer.item_price_gbp >= 5.0
-        min_plausible = max(5.0, rrp_gbp * 0.15)
-        max_plausible = rrp_gbp * 2.5
-        return min_plausible <= offer.item_price_gbp <= max_plausible
-
     tasks = []
-    if set_number:
-        tasks.append(
-            _fetch_brickset_uk_offers(
-                session,
-                set_number,
-                has_amazon_prime=has_amazon_prime,
-                prefer_click_and_collect=prefer_click_and_collect,
-            )
-        )
-        tasks.append(
-            _fetch_brickwatch_uk(
-                session,
-                set_number,
-                has_amazon_prime=has_amazon_prime,
-                prefer_click_and_collect=prefer_click_and_collect,
-                proxy_url=proxy_url,
-            )
-        )
-        tasks.append(_fetch_pricespy_uk(session, set_number, proxy_url=proxy_url))
-        tasks.append(_fetch_idealo_uk(session, set_number, proxy_url=proxy_url))
 
-    if direct_url:
+    if set_number:
+        clean_num = set_number.strip().split("-")[0]
+        tasks.append(
+            _fetch_direct_uk_store(
+                session,
+                source_key="amazon_uk",
+                label="Amazon UK",
+                url=f"https://www.amazon.co.uk/s?k=LEGO+{clean_num}",
+                cookies={"i18n-prefs": "GBP"},
+                parser_fn=lambda html: parse_amazon_uk_search_html(
+                    html, clean_num, rrp_gbp=rrp_gbp, has_amazon_prime=has_amazon_prime
+                ),
+            )
+        )
+        tasks.append(
+            _fetch_direct_uk_store(
+                session,
+                source_key="john_lewis",
+                label="John Lewis",
+                url=f"https://www.johnlewis.com/search?search-term=lego+{clean_num}",
+                parser_fn=lambda html: parse_john_lewis_search_html(
+                    html, clean_num, rrp_gbp=rrp_gbp, prefer_click_and_collect=prefer_click_and_collect
+                ),
+            )
+        )
+        tasks.append(
+            _fetch_direct_uk_store(
+                session,
+                source_key="argos",
+                label="Argos",
+                url=f"https://www.argos.co.uk/search/lego-{clean_num}/",
+                parser_fn=lambda html: parse_argos_search_html(
+                    html, clean_num, rrp_gbp=rrp_gbp, prefer_click_and_collect=prefer_click_and_collect
+                ),
+            )
+        )
+        tasks.append(
+            _fetch_direct_uk_store(
+                session,
+                source_key="disney_store",
+                label="Disney Store UK",
+                url=f"https://www.disneystore.co.uk/search?q=lego+{clean_num}",
+                parser_fn=lambda html: parse_disney_store_search_html(html, clean_num, rrp_gbp=rrp_gbp),
+            )
+        )
+
+        if serpapi_key and allow_serpapi:
+            tasks.append(
+                _fetch_serpapi_google_shopping_uk(
+                    session,
+                    clean_num,
+                    serpapi_key,
+                    rrp_gbp=rrp_gbp,
+                    has_amazon_prime=has_amazon_prime,
+                    prefer_click_and_collect=prefer_click_and_collect,
+                    on_credit_used=on_serpapi_credit_used,
+                )
+            )
+
+    if direct_url and match_approved_uk_retailer(direct_url) is not None:
         async def _check_direct() -> tuple[list[UKOffer], str | None]:
-            res = await fetch_price_for_url(session, direct_url, proxy_url=proxy_url)
-            if res.ok and res.quote is not None:
+            res = await fetch_price_for_url(session, direct_url)
+            if res.ok and res.quote is not None and res.quote.retailer in APPROVED_UK_RETAILERS:
                 if not res.quote.in_stock:
                     return [], f"Direct URL ({res.quote.retailer.display_name}): out of stock"
+                if not is_valid_lego_set_listing(name, set_number, res.quote.price_gbp, rrp_gbp):
+                    return [], f"Direct URL ({res.quote.retailer.display_name}): price outside RRP bounds"
                 ship = estimate_uk_shipping(
                     res.quote.price_gbp,
                     res.quote.retailer,
@@ -923,8 +942,6 @@ async def find_best_uk_offer(
                         shipping_gbp=ship.shipping_gbp,
                         total_gbp=ship.total_gbp,
                         shipping_note=ship.note,
-                        historical_low_gbp=res.quote.historical_low_gbp,
-                        historical_avg_gbp=res.quote.historical_avg_gbp,
                     )
                 ], None
             return [], f"Direct URL: {res.error}"
@@ -937,36 +954,9 @@ async def find_best_uk_offer(
             notes.append(f"Check error: {type(item).__name__}")
             continue
         found_offers, err = item
-        offers.extend(o for o in found_offers if _is_plausible_price(o))
+        offers.extend(o for o in found_offers if o.retailer in APPROVED_UK_RETAILERS)
         if err:
             notes.append(err)
-
-    # Stage 2 fallback: only hit heavy retailer search pages if Stage 1 found nothing
-    if not offers:
-        fallback_tasks = []
-        if set_number:
-            fallback_tasks.append(_fetch_pricerunner_uk(session, set_number, proxy_url=proxy_url))
-        for retailer, url in build_uk_search_urls(name, set_number):
-            fallback_tasks.append(
-                _check_retailer_url(
-                    session,
-                    retailer,
-                    url,
-                    set_number=set_number,
-                    has_amazon_prime=has_amazon_prime,
-                    prefer_click_and_collect=prefer_click_and_collect,
-                    proxy_url=proxy_url,
-                )
-            )
-        fb_results = await asyncio.gather(*fallback_tasks, return_exceptions=True)
-        for item in fb_results:
-            if isinstance(item, Exception):
-                notes.append(f"Check error: {type(item).__name__}")
-                continue
-            found_offers, err = item
-            offers.extend(o for o in found_offers if _is_plausible_price(o))
-            if err:
-                notes.append(err)
 
     if not offers:
         return None, notes

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import Enum
 
@@ -10,7 +11,9 @@ class UKRetailer(str, Enum):
     LEGO_UK = "lego_uk"
     SMYTHS = "smyths"
     JOHN_LEWIS = "john_lewis"
-    BRICKLINK_UK = "bricklink_uk"
+    CURRYS = "currys"
+    ENTERTAINER = "entertainer"
+    DISNEY_STORE = "disney_store"
     OTHER = "other"
 
     @property
@@ -21,10 +24,24 @@ class UKRetailer(str, Enum):
             UKRetailer.LEGO_UK: "LEGO.com UK",
             UKRetailer.SMYTHS: "Smyths Toys",
             UKRetailer.JOHN_LEWIS: "John Lewis",
-            UKRetailer.BRICKLINK_UK: "BrickLink UK",
+            UKRetailer.CURRYS: "Currys",
+            UKRetailer.ENTERTAINER: "The Entertainer",
+            UKRetailer.DISNEY_STORE: "Disney Store UK",
             UKRetailer.OTHER: "Other UK Retailer",
         }
         return names[self]
+
+
+APPROVED_UK_RETAILERS: tuple[UKRetailer, ...] = (
+    UKRetailer.AMAZON_UK,
+    UKRetailer.LEGO_UK,
+    UKRetailer.JOHN_LEWIS,
+    UKRetailer.SMYTHS,
+    UKRetailer.ARGOS,
+    UKRetailer.CURRYS,
+    UKRetailer.ENTERTAINER,
+    UKRetailer.DISNEY_STORE,
+)
 
 
 @dataclass(frozen=True)
@@ -34,23 +51,57 @@ class ShippingEstimate:
     note: str
 
 
-def detect_retailer_from_url(url: str | None) -> UKRetailer:
-    if not url:
-        return UKRetailer.OTHER
-    lower = url.lower()
-    if "amazon.co.uk" in lower:
+def match_approved_uk_retailer(merchant_or_url: str | None) -> UKRetailer | None:
+    """Strictly match ONLY the 8 approved UK online retailers from a URL or merchant name."""
+    if not merchant_or_url:
+        return None
+    lower = merchant_or_url.strip().lower()
+
+    # Reject non-UK Amazon domains or eBay/marketplace wrappers (e.g. "Argos on eBay")
+    if any(bad in lower for bad in ("ebay", "onbuy", "aliexpress", "temu", "fruugo", "wish", "vinted", "stockx")):
+        return None
+    if any(foreign_amz in lower for foreign_amz in ("amazon.com", "amazon.de", "amazon.fr", "amazon.es", "amazon.it", "amazon us")):
+        return None
+
+    if "amazon.co.uk" in lower or lower in ("amazon", "amazon uk", "amazon.co.uk - retail"):
         return UKRetailer.AMAZON_UK
-    if "argos.co.uk" in lower:
+    if lower.startswith("amazon") and "marketplace" not in lower:
+        return UKRetailer.AMAZON_UK
+    if "argos.co.uk" in lower or lower == "argos" or lower.startswith("argos "):
         return UKRetailer.ARGOS
-    if "lego.com" in lower:
+    if "lego.com" in lower or lower in ("lego", "lego uk", "lego store", "lego.com uk", "official lego shop"):
         return UKRetailer.LEGO_UK
-    if "smythstoys.com" in lower:
+    if "smythstoys.com" in lower or "smyths" in lower:
         return UKRetailer.SMYTHS
-    if "johnlewis.com" in lower:
+    if "johnlewis.com" in lower or "john lewis" in lower:
         return UKRetailer.JOHN_LEWIS
-    if "bricklink.com" in lower:
-        return UKRetailer.BRICKLINK_UK
-    return UKRetailer.OTHER
+    if "currys.co.uk" in lower or lower == "currys" or lower.startswith("currys "):
+        return UKRetailer.CURRYS
+    if "thetoyshop.com" in lower or "entertainer" in lower:
+        return UKRetailer.ENTERTAINER
+    if "disneystore.co.uk" in lower or "shopdisney.co.uk" in lower or "disney store" in lower:
+        return UKRetailer.DISNEY_STORE
+    return None
+
+
+def detect_retailer_from_url(url: str | None) -> UKRetailer:
+    matched = match_approved_uk_retailer(url)
+    return matched if matched is not None else UKRetailer.OTHER
+
+
+def parse_explicit_shipping_gbp(delivery_text: str | None) -> tuple[float, str] | None:
+    """Extract explicit GBP delivery price from a Google Shopping delivery label when present."""
+    if not delivery_text:
+        return None
+    clean = delivery_text.strip()
+    lower = clean.lower()
+    if "free" in lower and ("delivery" in lower or "shipping" in lower or "postage" in lower):
+        return 0.0, "Free UK delivery"
+    m = re.search(r"£\s*(\d{1,2}(?:\.\d{2})?)", clean)
+    if m and ("delivery" in lower or "shipping" in lower or "postage" in lower):
+        cost = round(float(m.group(1)), 2)
+        return cost, f"£{cost:.2f} UK delivery"
+    return None
 
 
 def estimate_uk_shipping(
@@ -59,9 +110,24 @@ def estimate_uk_shipping(
     *,
     has_amazon_prime: bool = False,
     prefer_click_and_collect: bool = False,
+    explicit_delivery_text: str | None = None,
 ) -> ShippingEstimate:
-    """Estimate UK delivery cost in GBP for major UK LEGO retailers."""
+    """Estimate UK delivery cost in GBP for the 8 approved UK LEGO retailers."""
     price = round(item_price_gbp, 2)
+
+    parsed_explicit = parse_explicit_shipping_gbp(explicit_delivery_text)
+    if parsed_explicit is not None:
+        ship_cost, ship_note = parsed_explicit
+        if retailer == UKRetailer.AMAZON_UK and has_amazon_prime:
+            return ShippingEstimate(0.0, price, "Free (Amazon Prime UK)")
+        if prefer_click_and_collect and retailer in (
+            UKRetailer.ARGOS,
+            UKRetailer.SMYTHS,
+            UKRetailer.CURRYS,
+            UKRetailer.ENTERTAINER,
+        ):
+            return ShippingEstimate(0.0, price, f"Free ({retailer.display_name} Click & Collect)")
+        return ShippingEstimate(ship_cost, round(price + ship_cost, 2), ship_note)
 
     if retailer == UKRetailer.AMAZON_UK:
         if has_amazon_prime:
@@ -94,7 +160,21 @@ def estimate_uk_shipping(
             return ShippingEstimate(0.0, price, "Free UK delivery (over £50)")
         return ShippingEstimate(4.50, round(price + 4.50, 2), "£4.50 UK delivery (free over £50)")
 
-    if retailer == UKRetailer.BRICKLINK_UK:
-        return ShippingEstimate(3.50, round(price + 3.50, 2), "~£3.50 est. Royal Mail UK postage")
+    if retailer == UKRetailer.CURRYS:
+        if prefer_click_and_collect or price >= 40.0:
+            return ShippingEstimate(0.0, price, "Free UK delivery / Click & Collect")
+        return ShippingEstimate(3.99, round(price + 3.99, 2), "£3.99 UK delivery (free over £40 or Click & Collect)")
+
+    if retailer == UKRetailer.ENTERTAINER:
+        if prefer_click_and_collect:
+            return ShippingEstimate(0.0, price, "Free (The Entertainer Click & Collect)")
+        if price >= 39.99:
+            return ShippingEstimate(0.0, price, "Free UK delivery (over £39.99)")
+        return ShippingEstimate(3.99, round(price + 3.99, 2), "£3.99 UK delivery (free over £39.99)")
+
+    if retailer == UKRetailer.DISNEY_STORE:
+        if price >= 50.0:
+            return ShippingEstimate(0.0, price, "Free UK delivery (over £50)")
+        return ShippingEstimate(3.99, round(price + 3.99, 2), "£3.99 UK delivery (free over £50)")
 
     return ShippingEstimate(0.0, price, "Shipping not estimated")

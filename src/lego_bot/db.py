@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import calendar
 import json
+import math
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -87,6 +89,13 @@ class PriceDatabase:
                 value TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS api_quota (
+                provider TEXT NOT NULL,
+                month_key TEXT NOT NULL,
+                calls_used INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (provider, month_key)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_price_history_item_time
             ON price_history (item_id, recorded_at DESC);
             """
@@ -104,6 +113,11 @@ class PriceDatabase:
     @staticmethod
     def _now_iso() -> str:
         return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _month_key(now: datetime | None = None) -> str:
+        dt = now or datetime.now(timezone.utc)
+        return dt.strftime("%Y-%m")
 
     @staticmethod
     def _row_to_item(row: sqlite3.Row) -> TrackedItem:
@@ -311,6 +325,10 @@ class PriceDatabase:
             for r in rows
         ]
 
+    def get_latest_price(self, item_id: int) -> PriceRecord | None:
+        hist = self.get_price_history(item_id, limit=1)
+        return hist[0] if hist else None
+
     def get_historical_low(self, item_id: int) -> float | None:
         row = self._conn.execute(
             "SELECT MIN(total_gbp) AS min_total FROM price_history WHERE item_id = ?",
@@ -352,6 +370,132 @@ class PriceDatabase:
             (item_id,),
         )
         self._conn.commit()
+
+    def purge_implausible_history(self) -> tuple[int, int]:
+        """Remove poisoned/stale outlier price_history rows (<40% of RRP or 'other' unverified)
+        and reset invalid last_alert_price_gbp states so genuine UK deals can alert properly."""
+        deleted_rows = 0
+        reset_items = 0
+        cur_other = self._conn.execute("DELETE FROM price_history WHERE retailer = 'other'")
+        deleted_rows += cur_other.rowcount
+
+        for item in self.list_items():
+            if item.rrp_gbp <= 0:
+                continue
+            min_ok = round(item.rrp_gbp * 0.40, 2)
+            max_ok = round(item.rrp_gbp * 1.35, 2)
+            cur = self._conn.execute(
+                "DELETE FROM price_history WHERE item_id = ? AND (price_gbp < ? OR price_gbp > ?)",
+                (item.id, min_ok, max_ok),
+            )
+            deleted_rows += cur.rowcount
+            if item.last_alert_price_gbp is not None and item.last_alert_price_gbp < min_ok:
+                self._conn.execute(
+                    "UPDATE tracked_items SET last_alert_price_gbp = NULL, last_alert_at = NULL WHERE id = ?",
+                    (item.id,),
+                )
+                reset_items += 1
+
+        self._conn.commit()
+        return deleted_rows, reset_items
+
+    # --- Persisted Dev Mode ---
+
+    def get_dev_mode(self, default: bool = False) -> bool:
+        row = self._conn.execute(
+            "SELECT value FROM bot_state WHERE key = 'dev_mode'"
+        ).fetchone()
+        if not row:
+            return default
+        return row["value"].lower() == "true"
+
+    def set_dev_mode(self, enabled: bool) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO bot_state (key, value) VALUES ('dev_mode', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            ("true" if enabled else "false",),
+        )
+        self._conn.commit()
+
+    # --- Monthly Token Quota Governor ---
+
+    def get_monthly_usage(self, provider: str, now: datetime | None = None) -> int:
+        mkey = self._month_key(now)
+        row = self._conn.execute(
+            "SELECT calls_used FROM api_quota WHERE provider = ? AND month_key = ?",
+            (provider, mkey),
+        ).fetchone()
+        return int(row["calls_used"]) if row else 0
+
+    def increment_monthly_usage(self, provider: str, count: int = 1, now: datetime | None = None) -> int:
+        mkey = self._month_key(now)
+        self._conn.execute(
+            """
+            INSERT INTO api_quota (provider, month_key, calls_used)
+            VALUES (?, ?, ?)
+            ON CONFLICT(provider, month_key) DO UPDATE SET calls_used = calls_used + excluded.calls_used
+            """,
+            (provider, mkey, count),
+        )
+        self._conn.commit()
+        return self.get_monthly_usage(provider, now=now)
+
+    def can_spend_token(
+        self,
+        provider: str,
+        monthly_limit: int,
+        *,
+        manual_force: bool = False,
+        now: datetime | None = None,
+    ) -> tuple[bool, int]:
+        """Pace API usage across the calendar month so tokens NEVER run out early.
+        Returns (allowed, max_cumulative_allowed_today)."""
+        dt = now or datetime.now(timezone.utc)
+        used = self.get_monthly_usage(provider, now=dt)
+        safe_ceiling = max(1, monthly_limit - 2)  # Always leave 2 safety margin
+        if used >= safe_ceiling:
+            return False, safe_ceiling
+
+        if manual_force:
+            return True, safe_ceiling
+
+        # Reserve 15% of monthly limit for manual force re-checks
+        auto_pool = max(1, int(monthly_limit * 0.85))
+        days_in_month = calendar.monthrange(dt.year, dt.month)[1]
+        allowed_by_today = max(1, math.ceil((auto_pool / days_in_month) * dt.day))
+        return used < allowed_by_today, allowed_by_today
+
+    def get_items_due_for_check(
+        self,
+        *,
+        min_age_hours: float = 4.0,
+        now: datetime | None = None,
+    ) -> list[TrackedItem]:
+        """Return wishlist items due for a background check, stalest first (retiring prioritized 1.5x)."""
+        dt = now or datetime.now(timezone.utc)
+        scored: list[tuple[float, TrackedItem]] = []
+        for item in self.list_items():
+            latest = self.get_latest_price(item.id)
+            if latest is None:
+                scored.append((1e9, item))
+                continue
+            try:
+                rec_dt = datetime.fromisoformat(latest.recorded_at)
+                if rec_dt.tzinfo is None:
+                    rec_dt = rec_dt.replace(tzinfo=timezone.utc)
+                age_hours = (dt - rec_dt).total_seconds() / 3600.0
+            except ValueError:
+                age_hours = 999.0
+
+            effective_min = min_age_hours / 1.5 if item.is_retiring else min_age_hours
+            if age_hours >= effective_min:
+                priority = age_hours * (1.5 if item.is_retiring else 1.0)
+                scored.append((priority, item))
+
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return [item for _, item in scored]
 
     def should_send_weekly_summary(self) -> bool:
         """Return True on Sundays if a weekly summary hasn't been sent in the last 6 days."""
