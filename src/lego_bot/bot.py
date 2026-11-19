@@ -22,6 +22,7 @@ from .predictor import PriceAnalysis, analyze_price
 from .shipping import APPROVED_UK_RETAILERS, UKRetailer, detect_retailer_from_url
 from .uk_finder import (
     HAS_CURL_CFFI,
+    build_uk_search_urls,
     clean_set_display_name,
     clear_cooldowns,
     clear_price_cache,
@@ -879,6 +880,23 @@ class LegoTrackerBot(discord.Client):
                             if "BUY NOW" in cached_analysis.verdict
                             else ("🟡" if "GOOD" in cached_analysis.verdict or "SOON" in cached_analysis.verdict else "🟠")
                         )
+                        fallback_url: Optional[str] = (
+                            item.url
+                            if item.url and detect_retailer_from_url(item.url) == rec_retailer
+                            else None
+                        )
+                        if not fallback_url and rec_retailer == UKRetailer.AMAZON_UK and item.set_number:
+                            clean_num = item.set_number.strip().split("-")[0]
+                            fallback_url = self.db.get_amazon_dp_urls().get(clean_num)
+                        if not fallback_url and item.set_number:
+                            fallback_url = dict(build_uk_search_urls(resolved_name, item.set_number)).get(rec_retailer)
+                        if not fallback_url:
+                            fallback_url = item.url
+                        verdict_line = (
+                            f"{icon} **{cached_analysis.verdict}** — [View Deal →]({fallback_url})"
+                            if fallback_url
+                            else f"{icon} **{cached_analysis.verdict}**"
+                        )
                         await _emit(
                             make_status_embed(
                                 f"🧩 {title}",
@@ -887,7 +905,7 @@ class LegoTrackerBot(discord.Client):
                                     f"## 🏷️ Last Verified Price: £{cached_analysis.total_gbp:.2f}\n"
                                     f"### Normal RRP: £{cached_analysis.rrp_gbp:.2f}  •  **{cached_analysis.discount_pct:.1f}% OFF**\n"
                                     f"📍 **Seller:** {rec_retailer.display_name} *(recorded `{latest.recorded_at[:10]}`)*\n"
-                                    f"{icon} **{cached_analysis.verdict}**"
+                                    f"{verdict_line}"
                                 ),
                                 color=discord.Color.blue(),
                                 image_url=box_art,
