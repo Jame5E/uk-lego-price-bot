@@ -492,7 +492,10 @@ class LegoTrackerBot(discord.Client):
             meta = None
             if needs_meta and item.set_number:
                 meta = await lookup_set_metadata(
-                    self.http_session, item.set_number, brickset_api_key=self.config.brickset_api_key
+                    self.http_session,
+                    item.set_number,
+                    brickset_api_key=self.config.brickset_api_key,
+                    proxy_url=self.config.proxy_url,
                 )
                 self._last_retiring_meta_check[item.id] = now_mono
                 if meta.is_retired:
@@ -709,7 +712,12 @@ class LegoTrackerBot(discord.Client):
                     return
 
                 meta = await asyncio.wait_for(
-                    lookup_set_metadata(self.http_session, clean_num, brickset_api_key=self.config.brickset_api_key),
+                    lookup_set_metadata(
+                        self.http_session,
+                        clean_num,
+                        brickset_api_key=self.config.brickset_api_key,
+                        proxy_url=self.config.proxy_url,
+                    ),
                     timeout=COMMAND_TIMEOUT_SECONDS,
                 )
                 resolved_name = name or meta.name or f"LEGO Set #{clean_num}"
