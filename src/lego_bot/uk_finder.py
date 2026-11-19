@@ -127,6 +127,19 @@ def pop_finished_cooldowns() -> list[str]:
     return [_SOURCE_DISPLAY_NAMES.get(k, k) for k in finished]
 
 
+def clear_cooldowns() -> list[str]:
+    """Manually reset all active store cooldowns/streaks and return cleared display names."""
+    now = time.monotonic()
+    active_keys = sorted(k for k, until in _SOURCE_COOLDOWN_UNTIL.items() if until > now)
+    _SOURCE_COOLDOWN_UNTIL.clear()
+    _SOURCE_FAIL_STREAK.clear()
+    _SOURCE_COOLDOWN_TIER.clear()
+    _SOURCE_FIRST_FAIL_AT.clear()
+    _SOURCE_OUTAGE_ALERTED.clear()
+    _COOLDOWN_EXPIRY_PENDING.clear()
+    return [_SOURCE_DISPLAY_NAMES.get(k, k) for k in active_keys]
+
+
 # In-memory price cache (30 minutes) and Amazon /dp/{asin} URL cache
 _PRICE_CACHE_TTL_SECONDS = 1800.0
 _PRICE_CACHE: dict[str, tuple[float, "UKOffer", list[str]]] = {}

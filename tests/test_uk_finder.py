@@ -349,3 +349,10 @@ def test_tiered_cooldowns_and_profile_rotation_and_dp_cache():
     _uk_mod._AMAZON_DP_URL_CACHE["42171"] = "https://www.amazon.co.uk/dp/B0CFVZ74KT"
     clear_price_cache()
     assert _uk_mod._AMAZON_DP_URL_CACHE == {}
+
+    # clear_cooldowns() resets active cooldowns and returns display names
+    _record_source_block("argos")
+    _record_source_block("argos")
+    _record_source_block("argos")
+    assert _uk_mod.clear_cooldowns() == ["Argos"]
+    assert _uk_mod.clear_cooldowns() == []

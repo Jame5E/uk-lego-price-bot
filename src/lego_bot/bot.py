@@ -23,6 +23,7 @@ from .shipping import APPROVED_UK_RETAILERS, UKRetailer, detect_retailer_from_ur
 from .uk_finder import (
     HAS_CURL_CFFI,
     clean_set_display_name,
+    clear_cooldowns,
     clear_price_cache,
     default_box_art_url,
     find_best_uk_offer,
@@ -1684,6 +1685,24 @@ class LegoTrackerBot(discord.Client):
                 color=discord.Color.green(),
             )
             await interaction.response.send_message(embed=embed)
+
+        @bot_group.command(name="clear_cooldowns", description="Reset all active store cooldowns immediately (Admin only)")
+        async def bot_clear_cooldowns(interaction: discord.Interaction) -> None:
+            if not is_admin_user(interaction, self.config.user_id):
+                await interaction.response.send_message(
+                    embed=make_error_embed("Admin Only", "Only server admins can use `/bot` commands."),
+                    ephemeral=True,
+                )
+                return
+            cleared_stores = clear_cooldowns()
+            msg = (
+                f"Reset active cooldowns for: {', '.join(f'**{s}**' for s in cleared_stores)}."
+                if cleared_stores
+                else "No stores were in cooldown (all block streaks reset)."
+            )
+            await interaction.response.send_message(
+                embed=make_status_embed("🔄 Store Cooldowns Cleared", msg, color=discord.Color.green())
+            )
 
         @bot_group.command(name="update", description="Pull the latest code from GitHub, sync dependencies, and restart the bot (Admin only)")
         async def bot_update(interaction: discord.Interaction) -> None:
