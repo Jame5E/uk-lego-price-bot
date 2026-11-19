@@ -641,14 +641,30 @@ class LegoTrackerBot(discord.Client):
                         self.db.remove_item(item.id)
                         if item.set_number:
                             remove_wishlist_entry(self.config.wishlist_path, item.set_number)
-                        await _emit(
-                            make_status_embed(
-                                f"📦 Removed Retired Set: {title}",
-                                "This LEGO set has now **retired** and was automatically removed from your wishlist.",
-                                color=discord.Color.dark_grey(),
-                                image_url=box_art,
-                            )
+                        retired_embed = make_status_embed(
+                            f"📦 Removed Retired Set: {title}",
+                            "This LEGO set has now **retired** and was automatically removed from your wishlist.",
+                            color=discord.Color.dark_grey(),
+                            image_url=box_art,
                         )
+                        if isinstance(channel, discord.abc.Messageable):
+                            if self.dev_mode:
+                                retired_content = f"🛠️ [DEV MODE] **{title}** has been removed from your wishlist because it has retired. *(pings suppressed)*"
+                                allowed = discord.AllowedMentions.none()
+                            else:
+                                pings = format_pings(
+                                    self.config.user_id,
+                                    item,
+                                    extra_user_ids=self.config.extra_notify_user_ids,
+                                )
+                                retired_content = f"{pings} **{title}** has been removed from your wishlist as it has **retired**."
+                                allowed = discord.AllowedMentions.all()
+                            await channel.send(
+                                content=retired_content,
+                                embed=retired_embed,
+                                allowed_mentions=allowed,
+                            )
+                        await _emit(retired_embed)
                         return
 
                     if meta.name and (resolved_name.startswith("LEGO Set #") or len(meta.name) >= len(resolved_name) - 4):
