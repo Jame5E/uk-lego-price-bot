@@ -2,6 +2,7 @@ import asyncio
 import time
 
 from src.lego_bot import bot as _bot_mod  # noqa: F401
+from src.lego_bot import uk_finder as _uk_mod
 from src.lego_bot.deal_filter import is_valid_lego_set_listing
 from src.lego_bot.shipping import APPROVED_UK_RETAILERS, UKRetailer
 from src.lego_bot.uk_finder import (
@@ -311,3 +312,40 @@ def test_clear_price_cache_and_amazon_multi_h2_and_cooldown_expiry():
     assert pop_finished_cooldowns() == []
     _SOURCE_COOLDOWN_UNTIL.clear()
     _COOLDOWN_EXPIRY_PENDING.clear()
+
+
+def test_tiered_cooldowns_and_profile_rotation_and_dp_cache():
+    _uk_mod._SOURCE_FAIL_STREAK.clear()
+    _uk_mod._SOURCE_COOLDOWN_TIER.clear()
+    _SOURCE_COOLDOWN_UNTIL.clear()
+    _COOLDOWN_EXPIRY_PENDING.clear()
+
+    start_idx = _uk_mod._CURL_PROFILE_IDX
+    # 1st and 2nd block do NOT trigger cooldown (threshold is 3), but DO rotate TLS profile
+    _record_source_block("amazon_uk")
+    _record_source_block("amazon_uk")
+    assert "amazon_uk" not in _SOURCE_COOLDOWN_UNTIL
+    assert _uk_mod._CURL_PROFILE_IDX == (start_idx + 2) % len(_uk_mod._CURL_PROFILES)
+
+    # 3rd block triggers Tier 0 cooldown (~180s)
+    _record_source_block("amazon_uk")
+    rem_t0 = _SOURCE_COOLDOWN_UNTIL["amazon_uk"] - time.monotonic()
+    assert 170 <= rem_t0 <= 185
+
+    # Next 3 blocks step up to Tier 1 (~600s)
+    _SOURCE_COOLDOWN_UNTIL.pop("amazon_uk", None)
+    _record_source_block("amazon_uk")
+    _record_source_block("amazon_uk")
+    _record_source_block("amazon_uk")
+    rem_t1 = _SOURCE_COOLDOWN_UNTIL["amazon_uk"] - time.monotonic()
+    assert 590 <= rem_t1 <= 605
+
+    # Recovery resets tier and streak
+    _record_source_ok("amazon_uk")
+    assert "amazon_uk" not in _uk_mod._SOURCE_COOLDOWN_TIER
+    assert "amazon_uk" not in _uk_mod._SOURCE_FAIL_STREAK
+
+    # _AMAZON_DP_URL_CACHE is cleared by clear_price_cache()
+    _uk_mod._AMAZON_DP_URL_CACHE["42171"] = "https://www.amazon.co.uk/dp/B0CFVZ74KT"
+    clear_price_cache()
+    assert _uk_mod._AMAZON_DP_URL_CACHE == {}

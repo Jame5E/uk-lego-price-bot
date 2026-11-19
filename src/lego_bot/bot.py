@@ -4,6 +4,7 @@ import asyncio
 import io
 import logging
 import os
+import random
 import sys
 import time
 from datetime import datetime, timezone
@@ -704,8 +705,8 @@ class LegoTrackerBot(discord.Client):
 
         async def _check_one(idx: int, item: TrackedItem) -> None:
             async with sem:
-                if scheduled and idx > 0:
-                    await asyncio.sleep(1.0)
+                if len(items) > 1 and idx > 0:
+                    await asyncio.sleep(random.uniform(1.5, 3.0))
 
                 rrp = item.rrp_gbp
                 is_retiring = item.is_retiring

@@ -49,9 +49,10 @@ GENERIC_BRICKSET_SUBTHEMES = {
 }
 
 # Per-source circuit breaker for any direct store that returns repeated 403/429
-_SOURCE_COOLDOWN_SECONDS = 900.0
+_SOURCE_COOLDOWN_TIERS: tuple[float, ...] = (180.0, 600.0, 900.0)
 _SOURCE_OUTAGE_ALERT_SECONDS = 7200.0
 _SOURCE_FAIL_STREAK: dict[str, int] = {}
+_SOURCE_COOLDOWN_TIER: dict[str, int] = {}
 _SOURCE_COOLDOWN_UNTIL: dict[str, float] = {}
 _SOURCE_FIRST_FAIL_AT: dict[str, float] = {}
 _SOURCE_OUTAGE_ALERTED: set[str] = set()
@@ -79,15 +80,21 @@ def _is_source_cooled_down(source_key: str) -> bool:
 def _record_source_block(source_key: str) -> None:
     now = time.monotonic()
     _SOURCE_FIRST_FAIL_AT.setdefault(source_key, now)
+    _rotate_curl_profile()
     streak = _SOURCE_FAIL_STREAK.get(source_key, 0) + 1
     _SOURCE_FAIL_STREAK[source_key] = streak
-    if streak >= 2:
-        _SOURCE_COOLDOWN_UNTIL[source_key] = now + _SOURCE_COOLDOWN_SECONDS
+    if streak >= 3:
+        tier = _SOURCE_COOLDOWN_TIER.get(source_key, 0)
+        duration = _SOURCE_COOLDOWN_TIERS[min(tier, len(_SOURCE_COOLDOWN_TIERS) - 1)]
+        _SOURCE_COOLDOWN_UNTIL[source_key] = now + duration
+        _SOURCE_COOLDOWN_TIER[source_key] = tier + 1
+        _SOURCE_FAIL_STREAK[source_key] = 0
         _COOLDOWN_EXPIRY_PENDING.discard(source_key)
 
 
 def _record_source_ok(source_key: str) -> None:
     _SOURCE_FAIL_STREAK.pop(source_key, None)
+    _SOURCE_COOLDOWN_TIER.pop(source_key, None)
     _SOURCE_COOLDOWN_UNTIL.pop(source_key, None)
     _SOURCE_FIRST_FAIL_AT.pop(source_key, None)
     _SOURCE_OUTAGE_ALERTED.discard(source_key)
@@ -120,9 +127,10 @@ def pop_finished_cooldowns() -> list[str]:
     return [_SOURCE_DISPLAY_NAMES.get(k, k) for k in finished]
 
 
-# In-memory price cache (30 minutes) to keep `/wishlist check` instant and save resources
+# In-memory price cache (30 minutes) and Amazon /dp/{asin} URL cache
 _PRICE_CACHE_TTL_SECONDS = 1800.0
 _PRICE_CACHE: dict[str, tuple[float, "UKOffer", list[str]]] = {}
+_AMAZON_DP_URL_CACHE: dict[str, str] = {}
 
 
 def get_source_health() -> dict[str, int]:
@@ -149,9 +157,10 @@ def get_price_cache_stats() -> tuple[int, int]:
 
 
 def clear_price_cache() -> int:
-    """Clear all cached price entries and return the number of removed entries."""
+    """Clear all cached price entries and Amazon ASIN URLs, returning removed price entries."""
     count = len(_PRICE_CACHE)
     _PRICE_CACHE.clear()
+    _AMAZON_DP_URL_CACHE.clear()
     return count
 
 
@@ -240,6 +249,24 @@ def _parse_exit_date_status(exit_date_text: str) -> tuple[bool, bool]:
 
 
 _CURL_SESSIONS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Any] = weakref.WeakKeyDictionary()
+_CURL_PROFILES: tuple[str, ...] = ("chrome124", "chrome120", "safari17_0", "edge101", "chrome")
+_CURL_PROFILE_IDX = 0
+
+
+def _rotate_curl_profile() -> None:
+    """Advance to the next browser TLS fingerprint and discard the current loop's session."""
+    global _CURL_PROFILE_IDX
+    _CURL_PROFILE_IDX = (_CURL_PROFILE_IDX + 1) % len(_CURL_PROFILES)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    stale = _CURL_SESSIONS.pop(loop, None)
+    if stale is not None:
+        try:
+            loop.create_task(stale.close())
+        except Exception:
+            pass
 
 
 def _get_curl_session() -> Any:
@@ -247,7 +274,8 @@ def _get_curl_session() -> Any:
     loop = asyncio.get_running_loop()
     csession = _CURL_SESSIONS.get(loop)
     if csession is None:
-        csession = CurlAsyncSession(impersonate="chrome")
+        profile = _CURL_PROFILES[_CURL_PROFILE_IDX % len(_CURL_PROFILES)]
+        csession = CurlAsyncSession(impersonate=profile)
         _CURL_SESSIONS[loop] = csession
     return csession
 
@@ -1091,20 +1119,73 @@ async def find_best_uk_offer(
     notes: list[str] = []
     tasks = []
 
+    used_direct_dp = False
     if set_number:
         clean_num = set_number.strip().split("-")[0]
-        tasks.append(
-            _fetch_direct_uk_store(
-                session,
-                source_key="amazon_uk",
-                label="Amazon UK",
-                url=f"https://www.amazon.co.uk/s?k=LEGO+{clean_num}",
-                cookies={"i18n-prefs": "GBP"},
-                parser_fn=lambda html: parse_amazon_uk_search_html(
-                    html, clean_num, rrp_gbp=rrp_gbp, has_amazon_prime=has_amazon_prime
-                ),
+        cached_dp_url = _AMAZON_DP_URL_CACHE.get(clean_num)
+        if not cached_dp_url and direct_url and "amazon.co.uk" in direct_url.lower() and "/dp/" in direct_url:
+            cached_dp_url = direct_url
+
+        if cached_dp_url:
+            used_direct_dp = True
+
+            async def _fetch_amazon_dp_direct() -> tuple[list[UKOffer], str | None]:
+                if _is_source_cooled_down("amazon_uk"):
+                    return [], "Amazon UK: skipped (cooldown)"
+                try:
+                    status, dp_html = await _http_get_html(
+                        session,
+                        cached_dp_url,
+                        cookies={"i18n-prefs": "GBP"},
+                        timeout_seconds=10.0,
+                    )
+                    if status == 404:
+                        _AMAZON_DP_URL_CACHE.pop(clean_num, None)
+                        return [], "Amazon UK: product page 404"
+                    if status != 200:
+                        if status in (202, 403, 429, 503):
+                            _record_source_block("amazon_uk")
+                        return [], f"Amazon UK: HTTP {status}"
+                    dp_lower = dp_html.lower()
+                    if (
+                        "validatecaptcha" in dp_lower
+                        or "enter the characters you see below" in dp_lower
+                        or "api-services-support@amazon" in dp_lower
+                    ):
+                        _record_source_block("amazon_uk")
+                        return [], "Amazon UK: rate-limited"
+                    _record_source_ok("amazon_uk")
+                    verified, definitively_bad = parse_amazon_uk_product_html(
+                        dp_html,
+                        cached_dp_url,
+                        clean_num,
+                        rrp_gbp=rrp_gbp,
+                        has_amazon_prime=has_amazon_prime,
+                    )
+                    if verified is not None:
+                        return [verified], None
+                    if definitively_bad:
+                        _AMAZON_DP_URL_CACHE.pop(clean_num, None)
+                        return [], "Amazon UK: out of stock"
+                    return [], "Amazon UK: not in stock / not listed"
+                except Exception as exc:
+                    _record_source_block("amazon_uk")
+                    return [], f"Amazon UK: {type(exc).__name__}"
+
+            tasks.append(_fetch_amazon_dp_direct())
+        else:
+            tasks.append(
+                _fetch_direct_uk_store(
+                    session,
+                    source_key="amazon_uk",
+                    label="Amazon UK",
+                    url=f"https://www.amazon.co.uk/s?k=LEGO+{clean_num}",
+                    cookies={"i18n-prefs": "GBP"},
+                    parser_fn=lambda html: parse_amazon_uk_search_html(
+                        html, clean_num, rrp_gbp=rrp_gbp, has_amazon_prime=has_amazon_prime
+                    ),
+                )
             )
-        )
         tasks.append(
             _fetch_direct_uk_store(
                 session,
@@ -1194,9 +1275,10 @@ async def find_best_uk_offer(
     offers.sort(key=lambda o: o.total_gbp)
     best = offers[0]
 
-    # Verify winning Amazon UK /dp/ offer on its product page to catch 3rd-party shipping/OOS
+    # Verify winning Amazon UK /dp/ offer on its product page (skipped if already fetched directly)
     if (
-        best.retailer == UKRetailer.AMAZON_UK
+        not used_direct_dp
+        and best.retailer == UKRetailer.AMAZON_UK
         and "/dp/" in best.url
         and set_number
         and not _is_source_cooled_down("amazon_uk")
@@ -1228,6 +1310,9 @@ async def find_best_uk_offer(
                     best = offers[0]
         except Exception:
             pass  # Fail open to search-card offer if /dp/ check times out
+
+    if set_number and best.retailer == UKRetailer.AMAZON_UK and "/dp/" in best.url:
+        _AMAZON_DP_URL_CACHE[set_number.strip().split("-")[0]] = best.url
 
     _PRICE_CACHE[cache_key] = (time.monotonic(), best, list(notes))
     return best, notes
