@@ -925,7 +925,7 @@ class LegoTrackerBot(discord.Client):
                 icon = "🟢" if "BUY NOW" in analysis.verdict else ("🟡" if "GOOD" in analysis.verdict or "SOON" in analysis.verdict else "🟠")
                 color = discord.Color.green() if "BUY NOW" in analysis.verdict else (discord.Color.gold() if "GOOD" in analysis.verdict or "SOON" in analysis.verdict else discord.Color.blue())
                 ship_line = (
-                    f"*(£{best_offer.item_price_gbp:.2f} item + £{best_offer.shipping_gbp:.2f} {best_offer.shipping_note})*\n"
+                    f"*(incl. £{best_offer.shipping_gbp:.2f} delivery — £{best_offer.item_price_gbp:.2f} item)*\n"
                     if best_offer.shipping_gbp > 0
                     else ""
                 )
