@@ -111,31 +111,34 @@ async def lookup_set_metadata(
                 if resp.status == 200:
                     html = await resp.text()
                     soup = BeautifulSoup(html, "html.parser")
-                    quote = parse_price_from_html(html, lego_url)
-                    badge_text = " ".join(
-                        el.get_text(" ", strip=True).lower()
-                        for el in soup.find_all(["span", "div"], attrs={"data-test": re.compile("flag|badge|status", re.I)})
-                    )
-                    lower_html = html.lower()
-                    retiring = (
-                        "retiring soon" in badge_text
-                        or '"retiringsoon":true' in lower_html
-                        or '"availabilitytext":"retiring soon"' in lower_html
-                    )
-
-                    og_title = soup.find("meta", attrs={"property": "og:title"})
-                    og_image = soup.find("meta", attrs={"property": "og:image"})
-                    name = og_title["content"].split("|")[0].strip() if og_title and og_title.get("content") else None
-                    image_url = og_image["content"].strip() if og_image and og_image.get("content") else default_box_art_url(clean_num)
-
-                    if quote is not None or name is not None or retiring:
-                        lego_meta = SetMetadata(
-                            name=name,
-                            rrp_gbp=quote.price_gbp if quote else None,
-                            is_retiring=retiring,
-                            image_url=image_url,
-                            source="lego_uk",
+                    try:
+                        quote = parse_price_from_html(html, lego_url)
+                        badge_text = " ".join(
+                            el.get_text(" ", strip=True).lower()
+                            for el in soup.find_all(["span", "div"], attrs={"data-test": re.compile("flag|badge|status", re.I)})
                         )
+                        lower_html = html.lower()
+                        retiring = (
+                            "retiring soon" in badge_text
+                            or '"retiringsoon":true' in lower_html
+                            or '"availabilitytext":"retiring soon"' in lower_html
+                        )
+
+                        og_title = soup.find("meta", attrs={"property": "og:title"})
+                        og_image = soup.find("meta", attrs={"property": "og:image"})
+                        name = og_title["content"].split("|")[0].strip() if og_title and og_title.get("content") else None
+                        image_url = og_image["content"].strip() if og_image and og_image.get("content") else default_box_art_url(clean_num)
+
+                        if quote is not None or name is not None or retiring:
+                            lego_meta = SetMetadata(
+                                name=name,
+                                rrp_gbp=quote.price_gbp if quote else None,
+                                is_retiring=retiring,
+                                image_url=image_url,
+                                source="lego_uk",
+                            )
+                    finally:
+                        soup.decompose()
         except Exception:
             pass
 
@@ -815,6 +818,7 @@ async def find_best_uk_offer(
     name: str,
     set_number: str | None,
     direct_url: str | None = None,
+    rrp_gbp: float | None = None,
     has_amazon_prime: bool = False,
     prefer_click_and_collect: bool = False,
     keepa_api_key: str | None = None,
@@ -823,6 +827,13 @@ async def find_best_uk_offer(
     """Check direct URL or multiple UK retailers concurrently and return the cheapest in-stock landed offer."""
     offers: list[UKOffer] = []
     notes: list[str] = []
+
+    def _is_plausible_price(offer: UKOffer) -> bool:
+        if rrp_gbp is None or rrp_gbp <= 0:
+            return offer.item_price_gbp >= 5.0
+        min_plausible = max(5.0, rrp_gbp * 0.15)
+        max_plausible = rrp_gbp * 2.5
+        return min_plausible <= offer.item_price_gbp <= max_plausible
 
     tasks = []
     if set_number and keepa_api_key:
@@ -913,7 +924,7 @@ async def find_best_uk_offer(
             notes.append(f"Check error: {type(item).__name__}")
             continue
         found_offers, err = item
-        offers.extend(found_offers)
+        offers.extend(o for o in found_offers if _is_plausible_price(o))
         if err:
             notes.append(err)
 
@@ -941,7 +952,7 @@ async def find_best_uk_offer(
                 notes.append(f"Check error: {type(item).__name__}")
                 continue
             found_offers, err = item
-            offers.extend(found_offers)
+            offers.extend(o for o in found_offers if _is_plausible_price(o))
             if err:
                 notes.append(err)
 
