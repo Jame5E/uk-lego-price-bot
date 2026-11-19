@@ -128,7 +128,7 @@ async def lookup_set_metadata(
     # Try Brickset public page first (has Theme/Category, Subtheme, RRP £, and Name)
     public_meta = await _lookup_brickset_public(session, clean_num)
 
-    lego_url = f"https://www.lego.com/en-gb/product/{clean_num}"
+    lego_url = build_lego_uk_product_url(public_meta.name, clean_num)
     lego_meta: SetMetadata | None = None
     if not public_meta.name or not public_meta.rrp_gbp or not public_meta.is_retiring:
         try:
@@ -350,13 +350,32 @@ async def _lookup_brickset(
     )
 
 
+def build_lego_uk_product_url(name: str | None, set_number: str) -> str:
+    """Build a LEGO.com UK product URL using the set name slug when available."""
+    clean_num = set_number.strip().split("-")[0]
+    if not name or name.strip().startswith("LEGO Set #"):
+        return f"https://www.lego.com/en-gb/product/{clean_num}"
+    cleaned = name.strip()
+    if ":" in cleaned and clean_num in cleaned.split(":", 1)[0]:
+        cleaned = cleaned.split(":", 1)[1].strip()
+    elif ":" in cleaned and len(cleaned.split(":", 1)[0]) < 24:
+        cleaned = cleaned.split(":", 1)[1].strip()
+    cleaned = re.sub(r"^lego\s+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(rf"^(?:#?\s*{re.escape(clean_num)}\s*[-–:]?\s*)", "", cleaned)
+    slug = re.sub(r"[^a-z0-9]+", "-", cleaned.lower()).strip("-")
+    if not slug or slug == clean_num:
+        return f"https://www.lego.com/en-gb/product/{clean_num}"
+    if not slug.endswith(f"-{clean_num}"):
+        slug = f"{slug}-{clean_num}"
+    return f"https://www.lego.com/en-gb/product/{slug}"
+
+
 def build_uk_search_urls(name: str, set_number: str | None) -> list[tuple[UKRetailer, str]]:
     """Build candidate UK retailer URLs for a LEGO set number."""
     query = quote_plus(f"LEGO {set_number}" if set_number else name)
     urls: list[tuple[UKRetailer, str]] = []
     if set_number:
-        clean_num = set_number.strip().split("-")[0]
-        urls.append((UKRetailer.LEGO_UK, f"https://www.lego.com/en-gb/product/{clean_num}"))
+        urls.append((UKRetailer.LEGO_UK, build_lego_uk_product_url(name, set_number)))
     urls.extend(
         [
             (UKRetailer.SMYTHS, f"https://www.smythstoys.com/uk/en-gb/search/?text={query}"),
@@ -390,16 +409,20 @@ def extract_first_gbp_price_from_search(html: str, set_number: str | None) -> fl
                     if set_number and set_number not in json.dumps(item):
                         continue
                     offers = item.get("offers")
+                    if isinstance(offers, list):
+                        offers = offers[0] if offers else None
                     if isinstance(offers, dict) and str(offers.get("priceCurrency", "GBP")).upper() == "GBP":
                         availability = str(offers.get("availability", "")).lower()
                         if "outofstock" in availability:
                             continue
-                        try:
-                            val = float(offers["price"])
-                            if val > 0:
-                                return round(val, 2)
-                        except (KeyError, TypeError, ValueError):
-                            pass
+                        raw_val = offers.get("price") or offers.get("lowPrice")
+                        if raw_val is not None:
+                            try:
+                                val = float(str(raw_val).replace(",", ""))
+                                if val > 0:
+                                    return round(val, 2)
+                            except ValueError:
+                                pass
 
         text = soup.get_text(" ", strip=True)
         if set_number and set_number in text:
@@ -658,6 +681,98 @@ async def _fetch_pricerunner_uk(
     ], None
 
 
+async def _fetch_comparison_site_uk(
+    session: aiohttp.ClientSession,
+    *,
+    source_key: str,
+    label: str,
+    url: str,
+    set_number: str,
+    proxy_url: str | None = None,
+) -> tuple[list[UKOffer], str | None]:
+    """Query a UK price-comparison search page with direct-then-proxy retry."""
+    if _is_source_cooled_down(source_key):
+        return [], f"{label}: temporarily skipped (cooldown)"
+
+    clean_num = set_number.strip().split("-")[0]
+    html: str | None = None
+    last_err = f"{label}: unknown error"
+    attempts: list[tuple[str | None, int]] = [(None, 10)]
+    if proxy_url:
+        attempts.append((proxy_url, 15))
+
+    for attempt_proxy, attempt_timeout in attempts:
+        try:
+            async with session.get(
+                url,
+                headers=DEFAULT_HEADERS,
+                proxy=attempt_proxy,
+                timeout=aiohttp.ClientTimeout(total=attempt_timeout),
+            ) as resp:
+                if resp.status == 200:
+                    html = await resp.text()
+                    break
+                last_err = f"{label}: HTTP {resp.status}"
+                if resp.status not in (202, 403, 429, 503):
+                    return [], last_err
+        except Exception as exc:
+            last_err = f"{label}: {type(exc).__name__}"
+
+    if html is None:
+        _record_source_block(source_key)
+        return [], last_err
+
+    _record_source_ok(source_key)
+    price = extract_first_gbp_price_from_search(html, clean_num)
+    if price is None:
+        return [], f"{label}: no matching GBP price found"
+    ship = estimate_uk_shipping(price, UKRetailer.OTHER)
+    return [
+        UKOffer(
+            retailer=UKRetailer.OTHER,
+            url=url,
+            item_price_gbp=price,
+            shipping_gbp=ship.shipping_gbp,
+            total_gbp=ship.total_gbp,
+            shipping_note=ship.note,
+        )
+    ], None
+
+
+async def _fetch_pricespy_uk(
+    session: aiohttp.ClientSession,
+    set_number: str,
+    *,
+    proxy_url: str | None = None,
+) -> tuple[list[UKOffer], str | None]:
+    clean_num = set_number.strip().split("-")[0]
+    return await _fetch_comparison_site_uk(
+        session,
+        source_key="pricespy_uk",
+        label="PriceSpy UK",
+        url=f"https://pricespy.co.uk/search?search=lego+{clean_num}",
+        set_number=clean_num,
+        proxy_url=proxy_url,
+    )
+
+
+async def _fetch_idealo_uk(
+    session: aiohttp.ClientSession,
+    set_number: str,
+    *,
+    proxy_url: str | None = None,
+) -> tuple[list[UKOffer], str | None]:
+    clean_num = set_number.strip().split("-")[0]
+    return await _fetch_comparison_site_uk(
+        session,
+        source_key="idealo_uk",
+        label="idealo UK",
+        url=f"https://www.idealo.co.uk/mscat.html?q=lego+{clean_num}",
+        set_number=clean_num,
+        proxy_url=proxy_url,
+    )
+
+
 async def _check_retailer_url(
     session: aiohttp.ClientSession,
     retailer: UKRetailer,
@@ -785,6 +900,8 @@ async def find_best_uk_offer(
                 proxy_url=proxy_url,
             )
         )
+        tasks.append(_fetch_pricespy_uk(session, set_number, proxy_url=proxy_url))
+        tasks.append(_fetch_idealo_uk(session, set_number, proxy_url=proxy_url))
 
     if direct_url:
         async def _check_direct() -> tuple[list[UKOffer], str | None]:

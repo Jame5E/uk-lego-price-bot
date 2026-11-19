@@ -1,8 +1,21 @@
 from src.lego_bot.shipping import UKRetailer
 from src.lego_bot.uk_finder import (
+    build_lego_uk_product_url,
     build_uk_search_urls,
     extract_first_gbp_price_from_search,
 )
+
+
+def test_build_lego_uk_product_url():
+    assert (
+        build_lego_uk_product_url("Licensed: 42171 Mercedes-AMG F1 W14 E Performance", "42171")
+        == "https://www.lego.com/en-gb/product/mercedes-amg-f1-w14-e-performance-42171"
+    )
+    assert (
+        build_lego_uk_product_url("LEGO Icons The Lord of the Rings: Rivendell", "10316")
+        == "https://www.lego.com/en-gb/product/the-lord-of-the-rings-rivendell-10316"
+    )
+    assert build_lego_uk_product_url("LEGO Set #42171", "42171") == "https://www.lego.com/en-gb/product/42171"
 
 
 def test_build_uk_search_urls_includes_major_uk_retailers():
@@ -23,6 +36,13 @@ def test_extract_first_gbp_price_from_search():
     """
     price = extract_first_gbp_price_from_search(html, "10316")
     assert price == 349.99
+
+    jsonld_html = """
+    <html><head><script type="application/ld+json">
+    {"itemListElement": [{"item": {"name": "LEGO 42171", "offers": {"@type": "AggregateOffer", "priceCurrency": "GBP", "lowPrice": "154.95"}}}]}
+    </script></head></html>
+    """
+    assert extract_first_gbp_price_from_search(jsonld_html, "42171") == 154.95
 
 
 def test_price_cache_and_bot_imports():
