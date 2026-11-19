@@ -324,17 +324,12 @@ class PriceDatabase:
         total_gbp: float,
         cooldown_hours: int,
     ) -> bool:
-        """Avoid repeat pings unless cooldown expired or price dropped further."""
+        """Price-drop-only alerts: alert on first deal, or if price drops >= £1 further.
+        Once a deal ends (reset_alert_state), a future deal will alert again."""
         if item.last_alert_at is None or item.last_alert_price_gbp is None:
             return True
 
-        if total_gbp <= item.last_alert_price_gbp - 1.0:
-            return True
-
-        last_dt = datetime.fromisoformat(item.last_alert_at)
-        if last_dt.tzinfo is None:
-            last_dt = last_dt.replace(tzinfo=timezone.utc)
-        return datetime.now(timezone.utc) - last_dt >= timedelta(hours=cooldown_hours)
+        return total_gbp <= item.last_alert_price_gbp - 1.0
 
     def mark_alerted(self, item_id: int, total_gbp: float) -> None:
         self._conn.execute(
@@ -344,6 +339,17 @@ class PriceDatabase:
             WHERE id = ?
             """,
             (round(total_gbp, 2), self._now_iso(), item_id),
+        )
+        self._conn.commit()
+
+    def reset_alert_state(self, item_id: int) -> None:
+        self._conn.execute(
+            """
+            UPDATE tracked_items
+            SET last_alert_price_gbp = NULL, last_alert_at = NULL
+            WHERE id = ?
+            """,
+            (item_id,),
         )
         self._conn.commit()
 
