@@ -4,16 +4,19 @@ A Discord bot that monitors your favourite LEGO sets/pieces in **GBP (£)** acro
 
 ## Features
 
-- **Channel Ping Alerts:** Pings `<@YOUR_USER_ID>` in your chosen channel with a rich embed.
+- **Channel Ping Alerts:** Pings you with the set name, landed price, retailer, and discount right in the notification text (so phone push notifications show the deal immediately), plus a rich embed and price chart.
+- **Pinned Status & Store Health:** Keeps a single pinned status message updated with the latest check result, next check time, and live UK store health/cooldowns.
 - **UK Shipping-Aware (£):** Estimates delivery fees per retailer (e.g., Argos £3.95 or free Click & Collect, Amazon UK free over £35 / Prime, LEGO.com UK free over £50, Smyths free over £20).
 - **Drop More vs. Go Back Up Forecast:** Compares the total landed price against RRP, tracked historical low, 90-day average, and whether the set is retiring soon.
 - **Slash Commands:**
-  - `/track` — Add a LEGO set or piece to your wishlist
-  - `/wishlist` — View all tracked items and latest prices
-  - `/check` — Run an immediate price check
-  - `/history` — View recorded price history in £
-  - `/remove` — Remove an item from your wishlist
-  - `/simulate_sale` — Send a test alert ping to preview the embed
+  - `/add` — Add a LEGO set to your wishlist using its set number
+  - `/list` — Compact, paginated wishlist with quick set inspector & edit/check buttons
+  - `/check` — Check live UK prices for a set (or all sets, Admin only)
+  - `/edit` — Update target price, minimum discount %, or retiring status
+  - `/history` — View recorded GBP price history and chart for a set
+  - `/pings` — Interactive menu to choose which sets a user gets pinged for
+  - `/remove` — Remove a set from your wishlist
+  - `/bot status | devmode | maintenance | update` — Admin-only management commands (hidden from non-admins)
 
 ## Setup
 
