@@ -423,6 +423,7 @@ class LegoTrackerBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.http_session: aiohttp.ClientSession | None = None
         self._last_retiring_meta_check: dict[int, float] = {}
+        self.dev_mode: bool = os.getenv("DEV_MODE", "false").lower() == "true"
 
     async def setup_hook(self) -> None:
         connector = aiohttp.TCPConnector(limit=12, ttl_dns_cache=300)
@@ -686,16 +687,24 @@ class LegoTrackerBot(discord.Client):
                     has_chart=chart_bytes is not None,
                 )
                 if isinstance(channel, discord.abc.Messageable):
-                    pings = format_pings(
-                        self.config.user_id,
-                        item,
-                        extra_user_ids=self.config.extra_notify_user_ids,
-                    )
+                    if self.dev_mode:
+                        alert_content = "🛠️ [DEV MODE] LEGO sale spotted! *(pings suppressed)*"
+                        allowed = discord.AllowedMentions.none()
+                    else:
+                        pings = format_pings(
+                            self.config.user_id,
+                            item,
+                            extra_user_ids=self.config.extra_notify_user_ids,
+                        )
+                        alert_content = f"{pings} LEGO sale spotted!"
+                        allowed = discord.AllowedMentions.all()
                     if chart_bytes:
                         file = discord.File(io.BytesIO(chart_bytes), filename="chart.png")
-                        await channel.send(content=f"{pings} LEGO sale spotted!", embeds=embeds, file=file)
+                        await channel.send(
+                            content=alert_content, embeds=embeds, file=file, allowed_mentions=allowed
+                        )
                     else:
-                        await channel.send(content=f"{pings} LEGO sale spotted!", embeds=embeds)
+                        await channel.send(content=alert_content, embeds=embeds, allowed_mentions=allowed)
                     self.db.mark_alerted(item.id, analysis.total_gbp)
 
         if not set_number and self.db.should_send_weekly_summary() and isinstance(channel, discord.abc.Messageable):
@@ -714,11 +723,17 @@ class LegoTrackerBot(discord.Client):
                 "\n".join(lines) if lines else "Your wishlist is empty.",
                 color=discord.Color.blue(),
             )
-            summary_pings = " ".join(
-                f"<@{uid}>"
-                for uid in dict.fromkeys([str(self.config.user_id), *self.config.extra_notify_user_ids])
-            )
-            await channel.send(content=f"{summary_pings} Weekly LEGO summary!", embed=summary_embed)
+            if self.dev_mode:
+                summary_content = "🛠️ [DEV MODE] Weekly LEGO summary! *(pings suppressed)*"
+                allowed = discord.AllowedMentions.none()
+            else:
+                summary_pings = " ".join(
+                    f"<@{uid}>"
+                    for uid in dict.fromkeys([str(self.config.user_id), *self.config.extra_notify_user_ids])
+                )
+                summary_content = f"{summary_pings} Weekly LEGO summary!"
+                allowed = discord.AllowedMentions.all()
+            await channel.send(content=summary_content, embed=summary_embed, allowed_mentions=allowed)
             self.db.mark_weekly_summary_sent()
 
         return result_embeds
@@ -1266,17 +1281,32 @@ class LegoTrackerBot(discord.Client):
                 api_parts.append("Brickset")
             apis_str = ", ".join(api_parts) if api_parts else "None configured"
 
+            dev_str = "ON (pings suppressed)" if self.dev_mode else "OFF"
             embed = make_status_embed(
                 "🤖 LEGO Bot Status",
                 (
                     f"⏱️ **Check Interval:** Every {self.config.check_interval_minutes} min (next {next_str})\n"
                     f"🧩 **Tracked Sets:** {len(items)} ({retiring_count} retiring soon)\n"
                     f"💾 **Price Cache:** {cached_count} set(s) cached ({cache_ttl // 60}m TTL)\n"
+                    f"🛠️ **Dev Mode:** {dev_str}\n"
                     f"🌐 **Proxy:** {proxy_str}\n"
                     f"🔑 **APIs:** {apis_str}\n\n"
                     f"**Source Health:**\n{health_lines}"
                 ),
                 color=discord.Color.blue(),
+            )
+            await interaction.response.send_message(embed=embed)
+
+        @bot_group.command(name="devmode", description="Toggle dev mode (suppresses user pings on alerts and summaries)")
+        @app_commands.describe(enabled="Set True to enable or False to disable (leave blank to toggle)")
+        async def bot_devmode(interaction: discord.Interaction, enabled: Optional[bool] = None) -> None:
+            self.dev_mode = (not self.dev_mode) if enabled is None else enabled
+            state = "ON (pings suppressed)" if self.dev_mode else "OFF (normal pings enabled)"
+            color = discord.Color.orange() if self.dev_mode else discord.Color.green()
+            embed = make_status_embed(
+                f"🛠️ Dev Mode: {'ON' if self.dev_mode else 'OFF'}",
+                f"Dev mode is now **{state}**.",
+                color=color,
             )
             await interaction.response.send_message(embed=embed)
 
