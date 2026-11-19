@@ -434,7 +434,7 @@ class LegoTrackerBot(discord.Client):
         self,
         set_number: str | None = None,
         *,
-        on_item_embed: Callable[[discord.Embed], Awaitable[None]] | None = None,
+        on_item_embed: Callable[[discord.Embed, Optional[discord.ui.View]], Awaitable[None]] | None = None,
         force_refresh: bool = False,
     ) -> list[discord.Embed]:
         assert self.http_session is not None
@@ -447,7 +447,7 @@ class LegoTrackerBot(discord.Client):
         if not items:
             empty_embed = make_status_embed("🧩 Your LEGO Wishlist", "No tracked LEGO items found.")
             if on_item_embed is not None:
-                await on_item_embed(empty_embed)
+                await on_item_embed(empty_embed, None)
             return [empty_embed]
 
         channel = self.get_channel(self.config.channel_id)
@@ -458,16 +458,17 @@ class LegoTrackerBot(discord.Client):
                 logger.error("Could not fetch alert channel %s: %s", self.config.channel_id, exc)
                 err_embed = make_error_embed("Channel Error", f"Could not access alert channel {self.config.channel_id}.")
                 if on_item_embed is not None:
-                    await on_item_embed(err_embed)
+                    await on_item_embed(err_embed, None)
                 return [err_embed]
 
         now_mono = time.monotonic()
         result_embeds: list[discord.Embed] = []
 
-        async def _emit(embed: discord.Embed) -> None:
+        async def _emit(embed: discord.Embed, item_set_number: str | None = None) -> None:
             result_embeds.append(embed)
             if on_item_embed is not None:
-                await on_item_embed(embed)
+                view = CheckResultView(self, item_set_number) if item_set_number else None
+                await on_item_embed(embed, view)
 
         for idx, item in enumerate(items):
             if idx > 0:
@@ -579,7 +580,8 @@ class LegoTrackerBot(discord.Client):
                         color=discord.Color.orange(),
                         image_url=box_art,
                         footer="Prices in GBP (£) including estimated UK delivery",
-                    )
+                    ),
+                    item.set_number,
                 )
                 continue
 
@@ -627,12 +629,16 @@ class LegoTrackerBot(discord.Client):
                     color=color,
                     image_url=box_art,
                     footer="Prices in GBP (£) including estimated UK delivery",
-                )
+                ),
+                item.set_number,
             )
 
             hit_target = item.target_price_gbp is not None and analysis.total_gbp <= item.target_price_gbp
             hit_discount = analysis.discount_pct >= item.min_discount_pct
-            if (hit_target or hit_discount) and self.db.should_alert(
+            if not (hit_target or hit_discount):
+                if item.last_alert_price_gbp is not None:
+                    self.db.reset_alert_state(item.id)
+            elif self.db.should_alert(
                 item, analysis.total_gbp, self.config.alert_cooldown_hours
             ):
                 series = list(reversed([h.total_gbp for h in self.db.get_price_history(item.id, limit=30)]))
@@ -864,8 +870,11 @@ class LegoTrackerBot(discord.Client):
         ) -> None:
             await interaction.response.defer()
             try:
-                async def _send_one(embed: discord.Embed) -> None:
-                    await interaction.followup.send(embed=embed)
+                async def _send_one(embed: discord.Embed, view: Optional[discord.ui.View] = None) -> None:
+                    if view is not None:
+                        await interaction.followup.send(embed=embed, view=view)
+                    else:
+                        await interaction.followup.send(embed=embed)
 
                 await asyncio.wait_for(
                     self.run_price_checks(set_number=set_number, on_item_embed=_send_one, force_refresh=force),
@@ -1140,8 +1149,11 @@ class LegoTrackerBot(discord.Client):
         async def item_check(interaction: discord.Interaction, set_number: Optional[str] = None) -> None:
             await interaction.response.defer()
             try:
-                async def _send_one(embed: discord.Embed) -> None:
-                    await interaction.followup.send(embed=embed)
+                async def _send_one(embed: discord.Embed, view: Optional[discord.ui.View] = None) -> None:
+                    if view is not None:
+                        await interaction.followup.send(embed=embed, view=view)
+                    else:
+                        await interaction.followup.send(embed=embed)
 
                 await asyncio.wait_for(
                     self.run_price_checks(set_number=set_number, on_item_embed=_send_one),
