@@ -495,6 +495,9 @@ class LegoTrackerBot(discord.Client):
             self.price_check_loop.cancel()
         if self.http_session and not self.http_session.closed:
             await self.http_session.close()
+        from .uk_finder import close_http_sessions
+
+        await close_http_sessions()
         self.db.close()
         await super().close()
 

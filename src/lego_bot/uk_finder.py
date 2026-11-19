@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import time
+import weakref
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -186,6 +187,33 @@ def _parse_exit_date_status(exit_date_text: str) -> tuple[bool, bool]:
     return False, False
 
 
+_CURL_SESSIONS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Any] = weakref.WeakKeyDictionary()
+
+
+def _get_curl_session() -> Any:
+    assert CurlAsyncSession is not None
+    loop = asyncio.get_running_loop()
+    csession = _CURL_SESSIONS.get(loop)
+    if csession is None:
+        csession = CurlAsyncSession(impersonate="chrome")
+        _CURL_SESSIONS[loop] = csession
+    return csession
+
+
+async def close_http_sessions() -> None:
+    """Close any shared CurlAsyncSession bound to the current event loop."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    csession = _CURL_SESSIONS.pop(loop, None)
+    if csession is not None:
+        try:
+            await csession.close()
+        except Exception:
+            pass
+
+
 async def _http_get_html(
     session: aiohttp.ClientSession | None,
     url: str,
@@ -193,9 +221,10 @@ async def _http_get_html(
     cookies: dict[str, str] | None = None,
     timeout_seconds: float = 10.0,
 ) -> tuple[int, str]:
-    """Fetch HTML using Chrome TLS impersonation (curl_cffi) when available, else aiohttp."""
+    """Fetch HTML using shared Chrome TLS impersonation (curl_cffi) when available, else aiohttp."""
     if HAS_CURL_CFFI and CurlAsyncSession is not None:
-        async with CurlAsyncSession(impersonate="chrome") as csession:
+        csession = _get_curl_session()
+        try:
             resp = await csession.get(
                 url,
                 cookies=cookies,
@@ -203,6 +232,16 @@ async def _http_get_html(
                 allow_redirects=True,
             )
             return int(resp.status_code), str(resp.text)
+        except Exception:
+            # Discard and recreate session once if the underlying connection went stale
+            loop = asyncio.get_running_loop()
+            stale = _CURL_SESSIONS.pop(loop, None)
+            if stale is not None:
+                try:
+                    await stale.close()
+                except Exception:
+                    pass
+            raise
 
     if session is None:
         raise RuntimeError("No HTTP session available")
@@ -538,6 +577,89 @@ def parse_amazon_uk_search_html(
                 )
             )
         return offers
+    finally:
+        soup.decompose()
+
+
+def parse_amazon_uk_product_html(
+    html: str,
+    url: str,
+    set_number: str,
+    *,
+    rrp_gbp: float | None = None,
+    has_amazon_prime: bool = False,
+) -> tuple[UKOffer | None, bool]:
+    """Parse an Amazon UK /dp/{asin} product page to verify stock, exact price, and seller/delivery.
+
+    Returns (verified_offer, is_definitively_invalid_or_oos).
+    """
+    clean_num = set_number.strip().split("-")[0]
+    soup = BeautifulSoup(html, "html.parser")
+    try:
+        loc_el = soup.find(id="glow-ingress-line2")
+        loc_text = loc_el.get_text(" ", strip=True).lower() if loc_el else ""
+        ex_vat_export = bool(loc_text) and not any(
+            uk_kw in loc_text for uk_kw in ("united kingdom", "select your address", "update location", "uk")
+        )
+
+        avail_el = soup.find(id="availability")
+        avail_text = avail_el.get_text(" ", strip=True).lower() if avail_el else ""
+        if any(phrase in avail_text for phrase in OUT_OF_STOCK_PHRASES):
+            return None, True
+
+        title_el = soup.find(id="productTitle")
+        title = title_el.get_text(" ", strip=True) if title_el else ""
+        if not title:
+            return None, False
+
+        price_el = (
+            soup.select_one("#corePriceDisplay_desktop_feature_div span.a-price:not(.a-text-price) span.a-offscreen")
+            or soup.select_one("#corePrice_feature_div span.a-price:not(.a-text-price) span.a-offscreen")
+            or soup.select_one("#apex_desktop span.a-price:not(.a-text-price) span.a-offscreen")
+        )
+        if not price_el:
+            return None, False
+        raw_price = price_el.get_text(strip=True)
+        m = re.search(r"£\s*(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)", raw_price)
+        if not m:
+            return None, False
+
+        price = float(m.group(1).replace(",", ""))
+        price = round(price * 1.20, 2) if ex_vat_export else round(price, 2)
+
+        if not is_valid_lego_set_listing(title, clean_num, price, rrp_gbp):
+            return None, True
+
+        merchant_el = soup.find(id="merchantInfoFeature_feature_div") or soup.find(id="tabular-buybox")
+        merchant_text = merchant_el.get_text(" ", strip=True).lower() if merchant_el else ""
+        sold_by_amazon = (not merchant_text) or ("amazon" in merchant_text)
+
+        explicit_delivery: str | None = None
+        if not ex_vat_export:
+            deliv_el = soup.find(id="mir-layout-DELIVERY_BLOCK-slot-PRIMARY_DELIVERY_MESSAGE_LARGE")
+            if deliv_el:
+                deliv_text = deliv_el.get_text(" ", strip=True)
+                if "£" in deliv_text or "free" in deliv_text.lower():
+                    explicit_delivery = deliv_text
+
+        ship = estimate_uk_shipping(
+            price,
+            UKRetailer.AMAZON_UK,
+            has_amazon_prime=has_amazon_prime if sold_by_amazon else False,
+            explicit_delivery_text=explicit_delivery,
+        )
+        note = ship.note if sold_by_amazon else f"{ship.note} (3rd-party seller)"
+        return (
+            UKOffer(
+                retailer=UKRetailer.AMAZON_UK,
+                url=url,
+                item_price_gbp=price,
+                shipping_gbp=ship.shipping_gbp,
+                total_gbp=ship.total_gbp,
+                shipping_note=note,
+            ),
+            False,
+        )
     finally:
         soup.decompose()
 
@@ -961,6 +1083,43 @@ async def find_best_uk_offer(
     if not offers:
         return None, notes
 
-    best = min(offers, key=lambda o: o.total_gbp)
+    offers.sort(key=lambda o: o.total_gbp)
+    best = offers[0]
+
+    # Verify winning Amazon UK /dp/ offer on its product page to catch 3rd-party shipping/OOS
+    if (
+        best.retailer == UKRetailer.AMAZON_UK
+        and "/dp/" in best.url
+        and set_number
+        and not _is_source_cooled_down("amazon_uk")
+    ):
+        clean_num = set_number.strip().split("-")[0]
+        try:
+            status, dp_html = await _http_get_html(
+                session,
+                best.url,
+                cookies={"i18n-prefs": "GBP"},
+                timeout_seconds=10.0,
+            )
+            if status == 200 and "validateCaptcha" not in dp_html:
+                verified, definitively_bad = parse_amazon_uk_product_html(
+                    dp_html,
+                    best.url,
+                    clean_num,
+                    rrp_gbp=rrp_gbp,
+                    has_amazon_prime=has_amazon_prime,
+                )
+                if verified is not None:
+                    offers[0] = verified
+                    offers.sort(key=lambda o: o.total_gbp)
+                    best = offers[0]
+                elif definitively_bad:
+                    offers.pop(0)
+                    if not offers:
+                        return None, [*notes, "Amazon UK: out of stock on product page"]
+                    best = offers[0]
+        except Exception:
+            pass  # Fail open to search-card offer if /dp/ check times out
+
     _PRICE_CACHE[cache_key] = (time.monotonic(), best, list(notes))
     return best, notes

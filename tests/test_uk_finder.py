@@ -14,6 +14,7 @@ from src.lego_bot.uk_finder import (
     find_best_uk_offer,
     get_price_cache_stats,
     get_source_health,
+    parse_amazon_uk_product_html,
     parse_amazon_uk_search_html,
     parse_argos_search_html,
     parse_john_lewis_search_html,
@@ -169,3 +170,32 @@ def test_extract_first_gbp_price_and_price_cache():
     assert offer.total_gbp == 170.99
     assert any("cache" in n.lower() for n in notes)
     _PRICE_CACHE.clear()
+
+
+def test_amazon_uk_product_page_verification():
+    dp_3p_html = """
+    <html><body>
+      <span id="glow-ingress-line2">United Kingdom</span>
+      <span id="productTitle">LEGO Technic Mercedes-AMG F1 W14 E Performance 42171</span>
+      <div id="availability">In stock</div>
+      <div id="corePrice_feature_div"><span class="a-price"><span class="a-offscreen">£145.00</span></span></div>
+      <div id="merchantInfoFeature_feature_div">Dispatches from and sold by BrickDealsUK</div>
+      <div id="mir-layout-DELIVERY_BLOCK-slot-PRIMARY_DELIVERY_MESSAGE_LARGE">£5.99 delivery Friday</div>
+    </body></html>
+    """
+    offer, bad = parse_amazon_uk_product_html(
+        dp_3p_html, "https://www.amazon.co.uk/dp/B0CFVZ74KT", "42171", rrp_gbp=189.99, has_amazon_prime=True
+    )
+    assert bad is False
+    assert offer is not None
+    assert offer.item_price_gbp == 145.00
+    assert offer.shipping_gbp == 5.99
+    assert offer.total_gbp == 150.99
+    assert "3rd-party seller" in offer.shipping_note
+
+    dp_oos_html = dp_3p_html.replace("In stock", "Currently unavailable.")
+    oos_offer, oos_bad = parse_amazon_uk_product_html(
+        dp_oos_html, "https://www.amazon.co.uk/dp/B0CFVZ74KT", "42171", rrp_gbp=189.99
+    )
+    assert oos_offer is None
+    assert oos_bad is True
