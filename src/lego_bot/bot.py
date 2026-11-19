@@ -1122,6 +1122,7 @@ class LegoTrackerBot(discord.Client):
 
         @wishlist_group.command(name="remove", description="Remove a LEGO set from your wishlist")
         @app_commands.describe(set_number="LEGO set number to remove (e.g. 10316)")
+        @app_commands.autocomplete(set_number=_set_number_autocomplete)
         async def wishlist_remove(interaction: discord.Interaction, set_number: str) -> None:
             item = self.db.get_item_by_set_number(set_number)
             if not item:
@@ -1142,6 +1143,7 @@ class LegoTrackerBot(discord.Client):
 
         @item_group.command(name="notify", description="Toggle who gets pinged when a LEGO set goes on sale")
         @app_commands.describe(set_number="LEGO set number (e.g. 10316)", user="Discord user to add/remove from pings")
+        @app_commands.autocomplete(set_number=_set_number_autocomplete)
         async def item_notify(interaction: discord.Interaction, set_number: str, user: discord.User) -> None:
             item = self.db.get_item_by_set_number(set_number)
             if not item:
@@ -1179,6 +1181,7 @@ class LegoTrackerBot(discord.Client):
 
         @item_group.command(name="notify_remove", description="Remove a user from sale pings for a LEGO set")
         @app_commands.describe(set_number="LEGO set number (e.g. 10316)", user="Discord user to remove from pings")
+        @app_commands.autocomplete(set_number=_set_number_autocomplete)
         async def item_notify_remove(interaction: discord.Interaction, set_number: str, user: discord.User) -> None:
             item = self.db.get_item_by_set_number(set_number)
             if not item:
@@ -1220,6 +1223,7 @@ class LegoTrackerBot(discord.Client):
 
         @item_group.command(name="notify_list", description="See who gets pinged when a LEGO set goes on sale")
         @app_commands.describe(set_number="Optional LEGO set number (e.g. 10316). Leave blank to see all sets.")
+        @app_commands.autocomplete(set_number=_set_number_autocomplete)
         async def item_notify_list(interaction: discord.Interaction, set_number: Optional[str] = None) -> None:
             if set_number:
                 item = self.db.get_item_by_set_number(set_number)
@@ -1381,6 +1385,48 @@ class LegoTrackerBot(discord.Client):
                 image_url=img,
             )
             await interaction.response.send_message(embed=embed)
+
+        @item_group.command(name="chart", description="View a GBP price history chart for a tracked LEGO set")
+        @app_commands.describe(set_number="LEGO set number (e.g. 10316)")
+        @app_commands.autocomplete(set_number=_set_number_autocomplete)
+        async def item_chart(interaction: discord.Interaction, set_number: str) -> None:
+            item = self.db.get_item_by_set_number(set_number)
+            if not item:
+                await interaction.response.send_message(
+                    embed=make_error_embed("Not Found", f"Set #{set_number} is not on your wishlist."),
+                    ephemeral=True,
+                )
+                return
+            records = self.db.get_price_history(item.id, limit=30)
+            if len(records) < 2:
+                await interaction.response.send_message(
+                    embed=make_status_embed(
+                        f"📈 Price Chart: {format_item_title(item)}",
+                        "Need at least **2** recorded price checks to draw a chart. Run `/wishlist check` to record today's price!",
+                        color=discord.Color.gold(),
+                        image_url=item.image_url or default_box_art_url(item.set_number),
+                    )
+                )
+                return
+
+            series = list(reversed([r.total_gbp for r in records]))
+            rrp = item.rrp_gbp if item.rrp_gbp > 0 else max(series)
+            chart_bytes = generate_price_chart(series, rrp)
+            low = min(series)
+            latest = series[-1]
+            embed = make_status_embed(
+                f"📈 Price Chart: {format_item_title(item)}",
+                (
+                    f"💷 **Normal RRP:** £{rrp:.2f}  •  "
+                    f"🏷️ **Latest:** £{latest:.2f}  •  "
+                    f"🔥 **Low:** £{low:.2f}  *(last {len(series)} checks)*"
+                ),
+                color=discord.Color.blue(),
+                image_url="attachment://chart.png",
+                footer=f"Set #{item.set_number or item.id} • Green = tracked price, Grey dashed = RRP",
+            )
+            file = discord.File(io.BytesIO(chart_bytes), filename="chart.png")
+            await interaction.response.send_message(embed=embed, file=file)
 
         @bot_group.command(name="status", description="Show bot schedule, UK retailer engine, monthly token quota, and source health")
         async def bot_status(interaction: discord.Interaction) -> None:
