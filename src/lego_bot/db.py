@@ -220,7 +220,7 @@ class PriceDatabase:
             values.append(round(rrp_gbp, 2))
         if target_price_gbp is not None:
             fields.append("target_price_gbp = ?")
-            values.append(round(target_price_gbp, 2))
+            values.append(round(target_price_gbp, 2) if target_price_gbp > 0 else None)
         if min_discount_pct is not None:
             fields.append("min_discount_pct = ?")
             values.append(round(min_discount_pct, 1))
