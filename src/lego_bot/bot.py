@@ -422,7 +422,7 @@ class LegoTrackerBot(discord.Client):
     @tasks.loop(minutes=30)
     async def price_check_loop(self) -> None:
         try:
-            await asyncio.wait_for(self.run_price_checks(), timeout=120.0)
+            await asyncio.wait_for(self.run_price_checks(), timeout=600.0)
         except Exception as exc:
             logger.error("Scheduled price check failed: %s", exc)
 
@@ -478,16 +478,17 @@ class LegoTrackerBot(discord.Client):
             resolved_name = item.name
             category = item.category
 
-            retiring_due = is_retiring and (
-                now_mono - self._last_retiring_meta_check.get(item.id, 0.0) >= 86400.0
+            meta_ttl = 86400.0 if is_retiring else 604800.0
+            meta_refresh_due = (
+                now_mono - self._last_retiring_meta_check.get(item.id, 0.0) >= meta_ttl
             )
             needs_meta = (
                 rrp <= 0
                 or not image_url
                 or not category
+                or not resolved_name
                 or resolved_name.startswith("LEGO Set #")
-                or ":" not in resolved_name
-                or retiring_due
+                or meta_refresh_due
             )
             meta = None
             if needs_meta and item.set_number:
@@ -672,7 +673,11 @@ class LegoTrackerBot(discord.Client):
                 "\n".join(lines) if lines else "Your wishlist is empty.",
                 color=discord.Color.blue(),
             )
-            await channel.send(content=f"<@{self.config.user_id}> Weekly LEGO summary!", embed=summary_embed)
+            summary_pings = " ".join(
+                f"<@{uid}>"
+                for uid in dict.fromkeys([str(self.config.user_id), *self.config.extra_notify_user_ids])
+            )
+            await channel.send(content=f"{summary_pings} Weekly LEGO summary!", embed=summary_embed)
             self.db.mark_weekly_summary_sent()
 
         return result_embeds
@@ -797,6 +802,8 @@ class LegoTrackerBot(discord.Client):
                 latest_line = f"🏷️ **Latest Price:** £{hist[0].total_gbp:.2f}\n" if hist else "🏷️ **Latest Price:** *Not checked yet*\n"
                 rrp_str = f"£{item.rrp_gbp:.2f}" if item.rrp_gbp > 0 else "Auto-detect"
                 cat_line = f"📂 **Category:** {item.category}\n" if item.category else ""
+                target_str = f"£{item.target_price_gbp:.2f}" if item.target_price_gbp else "None"
+                retire_line = "⚠️ **Retiring Soon:** Yes\n" if item.is_retiring else ""
                 pings = format_pings(
                     self.config.user_id,
                     item,
@@ -810,6 +817,8 @@ class LegoTrackerBot(discord.Client):
                             f"{cat_line}"
                             f"💷 **Normal RRP:** {rrp_str}\n"
                             f"{latest_line}"
+                            f"🎯 **Alert:** ≥{item.min_discount_pct:.0f}% off | Target {target_str}\n"
+                            f"{retire_line}"
                             f"🔔 **Notify:** {pings}"
                         ),
                         color=discord.Color.blue(),
@@ -823,30 +832,7 @@ class LegoTrackerBot(discord.Client):
             for batch in batches[1:]:
                 await interaction.followup.send(embeds=batch)
 
-        @wishlist_group.command(name="check", description="Check the current UK price of all items (or one specific set) on your wishlist")
-        @app_commands.describe(set_number="Optional LEGO set number to check (leave blank to check all)")
-        async def wishlist_check(interaction: discord.Interaction, set_number: Optional[str] = None) -> None:
-            await interaction.response.defer()
-            try:
-                async def _send_one(embed: discord.Embed) -> None:
-                    await interaction.followup.send(embed=embed)
-
-                await asyncio.wait_for(
-                    self.run_price_checks(set_number=set_number, on_item_embed=_send_one),
-                    timeout=COMMAND_TIMEOUT_SECONDS,
-                )
-            except asyncio.TimeoutError:
-                await interaction.followup.send(
-                    embed=make_error_embed("Price Check Timed Out", "UK retailers took too long to respond (>5m). Please try again.")
-                )
-            except Exception as exc:
-                logger.exception("wishlist check failed")
-                await interaction.followup.send(
-                    embed=make_error_embed("Price Check Error", str(exc))
-                )
-
-        @wishlist_check.autocomplete("set_number")
-        async def _wishlist_check_autocomplete(
+        async def _set_number_autocomplete(
             interaction: discord.Interaction,
             current: str,
         ) -> list[app_commands.Choice[str]]:
@@ -863,13 +849,37 @@ class LegoTrackerBot(discord.Client):
                     break
             return choices
 
+        @wishlist_group.command(name="check", description="Check the current UK price of all items (or one specific set) on your wishlist")
+        @app_commands.describe(set_number="Optional LEGO set number to check (leave blank to check all)")
+        @app_commands.autocomplete(set_number=_set_number_autocomplete)
+        async def wishlist_check(interaction: discord.Interaction, set_number: Optional[str] = None) -> None:
+            await interaction.response.defer()
+            try:
+                async def _send_one(embed: discord.Embed) -> None:
+                    await interaction.followup.send(embed=embed)
+
+                await asyncio.wait_for(
+                    self.run_price_checks(set_number=set_number, on_item_embed=_send_one),
+                    timeout=COMMAND_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                await interaction.followup.send(
+                    embed=make_error_embed("Price Check Timed Out", "UK retailers took too long to respond (>10m). Please try again.")
+                )
+            except Exception as exc:
+                logger.exception("wishlist check failed")
+                await interaction.followup.send(
+                    embed=make_error_embed("Price Check Error", str(exc))
+                )
+
         @wishlist_group.command(name="edit", description="Edit alert settings for a tracked LEGO set")
         @app_commands.describe(
             set_number="LEGO set number (e.g. 10316)",
-            target_price_gbp="New target price in £",
+            target_price_gbp="New target price in £ (enter 0 to clear)",
             min_discount_pct="New minimum discount %",
             is_retiring="Mark as retiring soon (True/False)",
         )
+        @app_commands.autocomplete(set_number=_set_number_autocomplete)
         async def wishlist_edit(
             interaction: discord.Interaction,
             set_number: str,
@@ -1117,6 +1127,7 @@ class LegoTrackerBot(discord.Client):
 
         @item_group.command(name="check", description="Check UK prices right now for one set or all sets")
         @app_commands.describe(set_number="Optional specific LEGO set number to check")
+        @app_commands.autocomplete(set_number=_set_number_autocomplete)
         async def item_check(interaction: discord.Interaction, set_number: Optional[str] = None) -> None:
             await interaction.response.defer()
             try:
@@ -1129,7 +1140,7 @@ class LegoTrackerBot(discord.Client):
                 )
             except asyncio.TimeoutError:
                 await interaction.followup.send(
-                    embed=make_error_embed("Price Check Timed Out", "The check took longer than 5m. Please try again.")
+                    embed=make_error_embed("Price Check Timed Out", "The check took longer than 10m. Please try again.")
                 )
             except Exception as exc:
                 logger.exception("item check failed")
@@ -1139,6 +1150,7 @@ class LegoTrackerBot(discord.Client):
 
         @item_group.command(name="history", description="View recent UK price history for a set")
         @app_commands.describe(set_number="LEGO set number (e.g. 10316)")
+        @app_commands.autocomplete(set_number=_set_number_autocomplete)
         async def item_history(interaction: discord.Interaction, set_number: str) -> None:
             item = self.db.get_item_by_set_number(set_number)
             if not item:
@@ -1172,6 +1184,7 @@ class LegoTrackerBot(discord.Client):
 
         @item_group.command(name="simulate_sale", description="Send a test deal alert with chart & full-width box art")
         @app_commands.describe(set_number="LEGO set number", sale_price_gbp="Simulated UK item price in £")
+        @app_commands.autocomplete(set_number=_set_number_autocomplete)
         async def item_simulate(interaction: discord.Interaction, set_number: str, sale_price_gbp: float) -> None:
             await interaction.response.defer()
             try:
@@ -1210,7 +1223,11 @@ class LegoTrackerBot(discord.Client):
                 )
                 channel = self.get_channel(self.config.channel_id) or await self.fetch_channel(self.config.channel_id)
                 if isinstance(channel, discord.abc.Messageable):
-                    pings = format_pings(self.config.user_id, item)
+                    pings = format_pings(
+                        self.config.user_id,
+                        item,
+                        extra_user_ids=self.config.extra_notify_user_ids,
+                    )
                     file = discord.File(io.BytesIO(chart_bytes), filename="chart.png")
                     await channel.send(content=f"{pings} LEGO sale spotted!", embeds=embeds, file=file)
                     await interaction.followup.send(
