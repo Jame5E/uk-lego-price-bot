@@ -664,7 +664,7 @@ class LegoTrackerBot(discord.Client):
             all_items = self.db.list_items()
             if not all_items:
                 return []
-            items = self.db.get_items_due_for_check(min_age_hours=4.0)[:4]
+            items = self.db.get_items_due_for_check(min_age_hours=4.0)[:1]
         else:
             items = self.db.list_items()
 
