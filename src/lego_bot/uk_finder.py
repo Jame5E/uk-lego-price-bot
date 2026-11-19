@@ -267,19 +267,14 @@ _CURL_PROFILE_IDX = 0
 
 
 def _rotate_curl_profile() -> None:
-    """Advance to the next browser TLS fingerprint and discard the current loop's session."""
+    """Advance to the next browser TLS fingerprint for the next session without aborting in-flight requests."""
     global _CURL_PROFILE_IDX
     _CURL_PROFILE_IDX = (_CURL_PROFILE_IDX + 1) % len(_CURL_PROFILES)
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return
-    stale = _CURL_SESSIONS.pop(loop, None)
-    if stale is not None:
-        try:
-            loop.create_task(stale.close())
-        except Exception:
-            pass
+    _CURL_SESSIONS.pop(loop, None)
 
 
 def _get_curl_session() -> Any:
