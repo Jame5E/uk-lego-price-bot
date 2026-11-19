@@ -828,6 +828,128 @@ async def _fetch_hotukdeals_uk(
     return offers, (None if offers else "HotUKDeals UK: no active deal listed")
 
 
+def parse_hotukdeals_search_html(
+    html: str,
+    set_number: str,
+    *,
+    has_amazon_prime: bool = False,
+    prefer_click_and_collect: bool = False,
+) -> list[UKOffer]:
+    """Extract active UK LEGO offers for a set number from HotUKDeals search HTML."""
+    clean_num = set_number.strip().split("-")[0]
+    if "£" not in html or clean_num not in html:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    try:
+        offers: list[UKOffer] = []
+        retailer_map = {
+            "amazon": UKRetailer.AMAZON_UK,
+            "argos": UKRetailer.ARGOS,
+            "lego.com": UKRetailer.LEGO_UK,
+            "lego shop": UKRetailer.LEGO_UK,
+            "smyths": UKRetailer.SMYTHS,
+            "john lewis": UKRetailer.JOHN_LEWIS,
+        }
+        seen_urls: set[str] = set()
+        for card in soup.find_all(["article", "div", "li"]):
+            text = card.get_text(" ", strip=True)
+            if clean_num not in text or "£" not in text or len(text) > 500:
+                continue
+            lower = text.lower()
+            if "expired" in lower or any(p in lower for p in OUT_OF_STOCK_PHRASES):
+                continue
+            m = re.search(r"£\s*(\d{1,4}(?:\.\d{2})?)", text)
+            if not m:
+                continue
+            price = round(float(m.group(1)), 2)
+            if price < 5.0:
+                continue
+            matched = UKRetailer.OTHER
+            for kw, ret in retailer_map.items():
+                if kw in lower:
+                    matched = ret
+                    break
+            link_tag = card.find("a", href=True)
+            href = str(link_tag["href"]).strip() if link_tag else ""
+            if href.startswith("/"):
+                href = f"https://www.hotukdeals.com{href}"
+            deal_url = href or f"https://www.hotukdeals.com/search?q=lego+{clean_num}"
+            if deal_url in seen_urls:
+                continue
+            seen_urls.add(deal_url)
+            ship = estimate_uk_shipping(
+                price,
+                matched,
+                has_amazon_prime=has_amazon_prime,
+                prefer_click_and_collect=prefer_click_and_collect,
+            )
+            offers.append(
+                UKOffer(
+                    retailer=matched,
+                    url=deal_url,
+                    item_price_gbp=price,
+                    shipping_gbp=ship.shipping_gbp,
+                    total_gbp=ship.total_gbp,
+                    shipping_note=ship.note,
+                )
+            )
+        return offers
+    finally:
+        soup.decompose()
+
+
+async def _fetch_hotukdeals_search_uk(
+    session: aiohttp.ClientSession,
+    set_number: str,
+    *,
+    has_amazon_prime: bool = False,
+    prefer_click_and_collect: bool = False,
+    proxy_url: str | None = None,
+) -> tuple[list[UKOffer], str | None]:
+    """Stage 2 fallback: search HotUKDeals specifically for the set number."""
+    if _is_source_cooled_down("hotukdeals_search"):
+        return [], "HotUKDeals Search: temporarily skipped (cooldown)"
+
+    clean_num = set_number.strip().split("-")[0]
+    url = f"https://www.hotukdeals.com/search?q=lego+{clean_num}"
+    html: str | None = None
+    last_err = "HotUKDeals Search: unknown error"
+    attempts: list[tuple[str | None, int]] = [(None, 8)]
+    if proxy_url:
+        attempts.append((proxy_url, 12))
+
+    for attempt_proxy, attempt_timeout in attempts:
+        try:
+            async with session.get(
+                url,
+                headers=DEFAULT_HEADERS,
+                proxy=attempt_proxy,
+                timeout=aiohttp.ClientTimeout(total=attempt_timeout),
+            ) as resp:
+                if resp.status == 200:
+                    html = await resp.text()
+                    break
+                last_err = f"HotUKDeals Search: HTTP {resp.status}"
+                if resp.status not in (202, 403, 429, 503):
+                    return [], last_err
+        except Exception as exc:
+            last_err = f"HotUKDeals Search: {type(exc).__name__}"
+
+    if html is None:
+        _record_source_block("hotukdeals_search")
+        return [], last_err
+
+    _record_source_ok("hotukdeals_search")
+    offers = parse_hotukdeals_search_html(
+        html,
+        set_number,
+        has_amazon_prime=has_amazon_prime,
+        prefer_click_and_collect=prefer_click_and_collect,
+    )
+    return offers, (None if offers else "HotUKDeals Search: no active deal found")
+
+
 async def find_best_uk_offer(
     session: aiohttp.ClientSession,
     *,
@@ -958,6 +1080,15 @@ async def find_best_uk_offer(
     if not offers:
         fallback_tasks = []
         if set_number:
+            fallback_tasks.append(
+                _fetch_hotukdeals_search_uk(
+                    session,
+                    set_number,
+                    has_amazon_prime=has_amazon_prime,
+                    prefer_click_and_collect=prefer_click_and_collect,
+                    proxy_url=proxy_url,
+                )
+            )
             fallback_tasks.append(_fetch_pricerunner_uk(session, set_number, proxy_url=proxy_url))
         for retailer, url in build_uk_search_urls(name, set_number):
             fallback_tasks.append(
