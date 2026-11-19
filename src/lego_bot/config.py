@@ -17,7 +17,6 @@ class Config:
     wishlist_path: str
     has_amazon_prime: bool
     prefer_click_and_collect: bool
-    keepa_api_key: str | None
     brickset_api_key: str | None
     extra_notify_user_ids: tuple[str, ...] = ("942902769319292948",)
     proxy_url: str | None = None
@@ -51,7 +50,6 @@ class Config:
             wishlist_path=os.getenv("WISHLIST_PATH", "wishlist.json").strip(),
             has_amazon_prime=os.getenv("HAS_AMAZON_PRIME", "false").lower() == "true",
             prefer_click_and_collect=os.getenv("PREFER_CLICK_AND_COLLECT", "false").lower() == "true",
-            keepa_api_key=os.getenv("KEEPA_API_KEY", "").strip() or None,
             brickset_api_key=os.getenv("BRICKSET_API_KEY", "").strip() or None,
             extra_notify_user_ids=extra_ids,
             proxy_url=os.getenv("PROXY_URL", "").strip() or None,

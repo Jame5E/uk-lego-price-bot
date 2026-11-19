@@ -232,7 +232,6 @@ async def run_once(*, test_mode: bool = False, force_weekly: bool = False) -> No
     cooldown_hours = max(1, int(os.getenv("ALERT_COOLDOWN_HOURS", "12")))
     has_prime = os.getenv("HAS_AMAZON_PRIME", "false").lower() == "true"
     prefer_cc = os.getenv("PREFER_CLICK_AND_COLLECT", "false").lower() == "true"
-    keepa_key = os.getenv("KEEPA_API_KEY", "").strip() or None
     brickset_key = os.getenv("BRICKSET_API_KEY", "").strip() or None
 
     entries = load_wishlist_entries(wishlist_path)
@@ -311,9 +310,9 @@ async def run_once(*, test_mode: bool = False, force_weekly: bool = False) -> No
                     name=item.name,
                     set_number=item.set_number,
                     direct_url=item.url,
+                    rrp_gbp=rrp if rrp > 0 else None,
                     has_amazon_prime=has_prime,
                     prefer_click_and_collect=prefer_cc,
-                    keepa_api_key=keepa_key,
                 )
                 if best_offer is None:
                     print(f"No in-stock UK offers found for {item.name}: {'; '.join(notes)}")

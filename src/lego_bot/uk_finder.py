@@ -12,7 +12,7 @@ from urllib.parse import quote_plus
 import aiohttp
 from bs4 import BeautifulSoup
 
-from .scraper import DEFAULT_HEADERS, fetch_price_for_url, parse_price_from_html, search_amazon_uk_keepa
+from .scraper import DEFAULT_HEADERS, fetch_price_for_url, parse_price_from_html
 from .shipping import UKRetailer, estimate_uk_shipping
 
 OUT_OF_STOCK_PHRASES = (
@@ -666,7 +666,6 @@ async def _check_retailer_url(
     set_number: str | None,
     has_amazon_prime: bool,
     prefer_click_and_collect: bool,
-    keepa_api_key: str | None,
     proxy_url: str | None = None,
 ) -> tuple[list[UKOffer], str | None]:
     source_key = f"retailer_{retailer.value}"
@@ -674,7 +673,7 @@ async def _check_retailer_url(
         return [], f"{retailer.display_name}: temporarily skipped (cooldown)"
 
     if retailer == UKRetailer.LEGO_UK:
-        res = await fetch_price_for_url(session, url, keepa_api_key=keepa_api_key, proxy_url=proxy_url)
+        res = await fetch_price_for_url(session, url, proxy_url=proxy_url)
         if res.ok and res.quote is not None:
             _record_source_ok(source_key)
             if not res.quote.in_stock:
@@ -735,248 +734,6 @@ async def _check_retailer_url(
     ], None
 
 
-_HUKD_CACHE_TTL = 600.0
-_HUKD_CACHE_XML: str | None = None
-_HUKD_CACHE_AT: float = 0.0
-
-
-def parse_hotukdeals_rss(
-    xml_text: str,
-    set_number: str,
-    *,
-    has_amazon_prime: bool = False,
-    prefer_click_and_collect: bool = False,
-) -> list[UKOffer]:
-    """Parse HotUKDeals LEGO RSS feed XML for active GBP offers matching set_number."""
-    clean_num = set_number.strip().split("-")[0]
-    if not clean_num:
-        return []
-    try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError:
-        return []
-
-    num_re = re.compile(rf"\b{re.escape(clean_num)}\b")
-    retailer_map = {
-        "amazon": UKRetailer.AMAZON_UK,
-        "argos": UKRetailer.ARGOS,
-        "smyths": UKRetailer.SMYTHS,
-        "john lewis": UKRetailer.JOHN_LEWIS,
-        "lego.com": UKRetailer.LEGO_UK,
-        "lego store": UKRetailer.LEGO_UK,
-    }
-    offers: list[UKOffer] = []
-
-    for item in root.findall(".//item"):
-        title = (item.findtext("title") or "").strip()
-        link = (item.findtext("link") or "").strip()
-        desc = (item.findtext("description") or "").strip()
-        combined = f"{title} {desc}"
-        if not num_re.search(combined):
-            continue
-        lower = combined.lower()
-        if "expired" in lower or any(p in lower for p in OUT_OF_STOCK_PHRASES):
-            continue
-
-        m = re.search(r"£\s*(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)", title) or re.search(
-            r"£\s*(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)", desc
-        )
-        if not m:
-            continue
-        price = round(float(m.group(1).replace(",", "")), 2)
-        if price <= 0:
-            continue
-
-        matched = UKRetailer.OTHER
-        for kw, ret in retailer_map.items():
-            if kw in lower:
-                matched = ret
-                break
-
-        ship = estimate_uk_shipping(
-            price,
-            matched,
-            has_amazon_prime=has_amazon_prime,
-            prefer_click_and_collect=prefer_click_and_collect,
-        )
-        offers.append(
-            UKOffer(
-                retailer=matched,
-                url=link or f"https://www.hotukdeals.com/search?q=lego+{clean_num}",
-                item_price_gbp=price,
-                shipping_gbp=ship.shipping_gbp,
-                total_gbp=ship.total_gbp,
-                shipping_note=ship.note,
-            )
-        )
-
-    return offers
-
-
-async def _fetch_hotukdeals_uk(
-    session: aiohttp.ClientSession,
-    set_number: str,
-    *,
-    has_amazon_prime: bool = False,
-    prefer_click_and_collect: bool = False,
-    proxy_url: str | None = None,
-) -> tuple[list[UKOffer], str | None]:
-    """Check HotUKDeals UK LEGO RSS feed (cached 10 minutes to avoid extra requests)."""
-    global _HUKD_CACHE_XML, _HUKD_CACHE_AT
-
-    if _is_source_cooled_down("hotukdeals_uk"):
-        return [], "HotUKDeals UK: temporarily skipped (cooldown)"
-
-    now = time.monotonic()
-    xml_text = _HUKD_CACHE_XML if (_HUKD_CACHE_XML and now - _HUKD_CACHE_AT < _HUKD_CACHE_TTL) else None
-
-    if xml_text is None:
-        url = "https://www.hotukdeals.com/rss/tag/lego"
-        try:
-            async with session.get(url, headers=DEFAULT_HEADERS, proxy=proxy_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                if resp.status != 200:
-                    if resp.status in (202, 403, 429, 503):
-                        _record_source_block("hotukdeals_uk")
-                    return [], f"HotUKDeals UK: HTTP {resp.status}"
-                xml_text = await resp.text()
-                _HUKD_CACHE_XML = xml_text
-                _HUKD_CACHE_AT = now
-                _record_source_ok("hotukdeals_uk")
-        except Exception as exc:
-            _record_source_block("hotukdeals_uk")
-            return [], f"HotUKDeals UK: {type(exc).__name__}"
-
-    offers = parse_hotukdeals_rss(
-        xml_text,
-        set_number,
-        has_amazon_prime=has_amazon_prime,
-        prefer_click_and_collect=prefer_click_and_collect,
-    )
-    return offers, (None if offers else "HotUKDeals UK: no active deal listed")
-
-
-def parse_hotukdeals_search_html(
-    html: str,
-    set_number: str,
-    *,
-    has_amazon_prime: bool = False,
-    prefer_click_and_collect: bool = False,
-) -> list[UKOffer]:
-    """Extract active UK LEGO offers for a set number from HotUKDeals search HTML."""
-    clean_num = set_number.strip().split("-")[0]
-    if "£" not in html or clean_num not in html:
-        return []
-
-    soup = BeautifulSoup(html, "html.parser")
-    try:
-        offers: list[UKOffer] = []
-        retailer_map = {
-            "amazon": UKRetailer.AMAZON_UK,
-            "argos": UKRetailer.ARGOS,
-            "lego.com": UKRetailer.LEGO_UK,
-            "lego shop": UKRetailer.LEGO_UK,
-            "smyths": UKRetailer.SMYTHS,
-            "john lewis": UKRetailer.JOHN_LEWIS,
-        }
-        seen_urls: set[str] = set()
-        for card in soup.find_all(["article", "div", "li"]):
-            text = card.get_text(" ", strip=True)
-            if clean_num not in text or "£" not in text or len(text) > 500:
-                continue
-            lower = text.lower()
-            if "expired" in lower or any(p in lower for p in OUT_OF_STOCK_PHRASES):
-                continue
-            m = re.search(r"£\s*(\d{1,4}(?:\.\d{2})?)", text)
-            if not m:
-                continue
-            price = round(float(m.group(1)), 2)
-            if price < 5.0:
-                continue
-            matched = UKRetailer.OTHER
-            for kw, ret in retailer_map.items():
-                if kw in lower:
-                    matched = ret
-                    break
-            link_tag = card.find("a", href=True)
-            href = str(link_tag["href"]).strip() if link_tag else ""
-            if href.startswith("/"):
-                href = f"https://www.hotukdeals.com{href}"
-            deal_url = href or f"https://www.hotukdeals.com/search?q=lego+{clean_num}"
-            if deal_url in seen_urls:
-                continue
-            seen_urls.add(deal_url)
-            ship = estimate_uk_shipping(
-                price,
-                matched,
-                has_amazon_prime=has_amazon_prime,
-                prefer_click_and_collect=prefer_click_and_collect,
-            )
-            offers.append(
-                UKOffer(
-                    retailer=matched,
-                    url=deal_url,
-                    item_price_gbp=price,
-                    shipping_gbp=ship.shipping_gbp,
-                    total_gbp=ship.total_gbp,
-                    shipping_note=ship.note,
-                )
-            )
-        return offers
-    finally:
-        soup.decompose()
-
-
-async def _fetch_hotukdeals_search_uk(
-    session: aiohttp.ClientSession,
-    set_number: str,
-    *,
-    has_amazon_prime: bool = False,
-    prefer_click_and_collect: bool = False,
-    proxy_url: str | None = None,
-) -> tuple[list[UKOffer], str | None]:
-    """Stage 2 fallback: search HotUKDeals specifically for the set number."""
-    if _is_source_cooled_down("hotukdeals_search"):
-        return [], "HotUKDeals Search: temporarily skipped (cooldown)"
-
-    clean_num = set_number.strip().split("-")[0]
-    url = f"https://www.hotukdeals.com/search?q=lego+{clean_num}"
-    html: str | None = None
-    last_err = "HotUKDeals Search: unknown error"
-    attempts: list[tuple[str | None, int]] = [(None, 8)]
-    if proxy_url:
-        attempts.append((proxy_url, 12))
-
-    for attempt_proxy, attempt_timeout in attempts:
-        try:
-            async with session.get(
-                url,
-                headers=DEFAULT_HEADERS,
-                proxy=attempt_proxy,
-                timeout=aiohttp.ClientTimeout(total=attempt_timeout),
-            ) as resp:
-                if resp.status == 200:
-                    html = await resp.text()
-                    break
-                last_err = f"HotUKDeals Search: HTTP {resp.status}"
-                if resp.status not in (202, 403, 429, 503):
-                    return [], last_err
-        except Exception as exc:
-            last_err = f"HotUKDeals Search: {type(exc).__name__}"
-
-    if html is None:
-        _record_source_block("hotukdeals_search")
-        return [], last_err
-
-    _record_source_ok("hotukdeals_search")
-    offers = parse_hotukdeals_search_html(
-        html,
-        set_number,
-        has_amazon_prime=has_amazon_prime,
-        prefer_click_and_collect=prefer_click_and_collect,
-    )
-    return offers, (None if offers else "HotUKDeals Search: no active deal found")
-
-
 async def find_best_uk_offer(
     session: aiohttp.ClientSession,
     *,
@@ -986,7 +743,6 @@ async def find_best_uk_offer(
     rrp_gbp: float | None = None,
     has_amazon_prime: bool = False,
     prefer_click_and_collect: bool = False,
-    keepa_api_key: str | None = None,
     proxy_url: str | None = None,
     force_refresh: bool = False,
 ) -> tuple[UKOffer | None, list[str]]:
@@ -1011,42 +767,7 @@ async def find_best_uk_offer(
         return min_plausible <= offer.item_price_gbp <= max_plausible
 
     tasks = []
-    if set_number and keepa_api_key:
-        async def _check_keepa_search() -> tuple[list[UKOffer], str | None]:
-            res, amazon_url = await search_amazon_uk_keepa(session, set_number, keepa_api_key)
-            if res.ok and res.quote is not None:
-                ship = estimate_uk_shipping(
-                    res.quote.price_gbp,
-                    res.quote.retailer,
-                    has_amazon_prime=has_amazon_prime,
-                    prefer_click_and_collect=prefer_click_and_collect,
-                )
-                return [
-                    UKOffer(
-                        retailer=res.quote.retailer,
-                        url=amazon_url or f"https://www.amazon.co.uk/s?k=LEGO+{set_number}",
-                        item_price_gbp=res.quote.price_gbp,
-                        shipping_gbp=ship.shipping_gbp,
-                        total_gbp=ship.total_gbp,
-                        shipping_note=ship.note,
-                        historical_low_gbp=res.quote.historical_low_gbp,
-                        historical_avg_gbp=res.quote.historical_avg_gbp,
-                    )
-                ], None
-            return [], res.error
-
-        tasks.append(_check_keepa_search())
-
     if set_number:
-        tasks.append(
-            _fetch_hotukdeals_uk(
-                session,
-                set_number,
-                has_amazon_prime=has_amazon_prime,
-                prefer_click_and_collect=prefer_click_and_collect,
-                proxy_url=proxy_url,
-            )
-        )
         tasks.append(
             _fetch_brickset_uk_offers(
                 session,
@@ -1067,7 +788,7 @@ async def find_best_uk_offer(
 
     if direct_url:
         async def _check_direct() -> tuple[list[UKOffer], str | None]:
-            res = await fetch_price_for_url(session, direct_url, keepa_api_key=keepa_api_key, proxy_url=proxy_url)
+            res = await fetch_price_for_url(session, direct_url, proxy_url=proxy_url)
             if res.ok and res.quote is not None:
                 if not res.quote.in_stock:
                     return [], f"Direct URL ({res.quote.retailer.display_name}): out of stock"
@@ -1107,15 +828,6 @@ async def find_best_uk_offer(
     if not offers:
         fallback_tasks = []
         if set_number:
-            fallback_tasks.append(
-                _fetch_hotukdeals_search_uk(
-                    session,
-                    set_number,
-                    has_amazon_prime=has_amazon_prime,
-                    prefer_click_and_collect=prefer_click_and_collect,
-                    proxy_url=proxy_url,
-                )
-            )
             fallback_tasks.append(_fetch_pricerunner_uk(session, set_number, proxy_url=proxy_url))
         for retailer, url in build_uk_search_urls(name, set_number):
             fallback_tasks.append(
@@ -1126,7 +838,6 @@ async def find_best_uk_offer(
                     set_number=set_number,
                     has_amazon_prime=has_amazon_prime,
                     prefer_click_and_collect=prefer_click_and_collect,
-                    keepa_api_key=keepa_api_key,
                     proxy_url=proxy_url,
                 )
             )

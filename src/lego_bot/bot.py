@@ -5,6 +5,7 @@ import io
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from typing import Awaitable, Callable, Literal, Optional
 
 import aiohttp
@@ -17,7 +18,13 @@ from .config import Config
 from .db import PriceDatabase, TrackedItem
 from .predictor import PriceAnalysis, analyze_price
 from .shipping import UKRetailer, detect_retailer_from_url, estimate_uk_shipping
-from .uk_finder import default_box_art_url, find_best_uk_offer, lookup_set_metadata
+from .uk_finder import (
+    default_box_art_url,
+    find_best_uk_offer,
+    get_price_cache_stats,
+    get_source_health,
+    lookup_set_metadata,
+)
 from .wishlist_store import remove_wishlist_entry, upsert_wishlist_entry
 
 logging.basicConfig(
@@ -106,7 +113,7 @@ def build_alert_embeds(
 
     embed = discord.Embed(
         title=f"{title_prefix}{atl_badge}{title}",
-        url=link_url or discord.Embed.Empty,
+        url=link_url or None,
         description=headline,
         color=color,
     )
@@ -581,9 +588,9 @@ class LegoTrackerBot(discord.Client):
                 name=resolved_name,
                 set_number=item.set_number,
                 direct_url=item.url,
+                rrp_gbp=rrp if rrp > 0 else None,
                 has_amazon_prime=self.config.has_amazon_prime,
                 prefer_click_and_collect=self.config.prefer_click_and_collect,
-                keepa_api_key=self.config.keepa_api_key,
                 proxy_url=self.config.proxy_url,
                 force_refresh=force_refresh,
             )
@@ -1257,8 +1264,6 @@ class LegoTrackerBot(discord.Client):
             api_parts = []
             if self.config.brickset_api_key:
                 api_parts.append("Brickset")
-            if self.config.keepa_api_key:
-                api_parts.append("Keepa")
             apis_str = ", ".join(api_parts) if api_parts else "None configured"
 
             embed = make_status_embed(
