@@ -27,6 +27,7 @@ from .uk_finder import (
     get_price_cache_stats,
     get_source_health,
     lookup_set_metadata,
+    pop_long_outage_sources,
 )
 from .wishlist_store import load_wishlist_entries, remove_wishlist_entry, upsert_wishlist_entry
 
@@ -418,6 +419,58 @@ class CheckResultView(discord.ui.View):
         await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
 
 
+class RetiredSetView(discord.ui.View):
+    """Undo button attached to retired-set auto-removal notifications."""
+
+    def __init__(self, bot: "LegoTrackerBot", item: TrackedItem) -> None:
+        super().__init__(timeout=86400)
+        self.bot = bot
+        self.item = item
+
+    @discord.ui.button(label="Re-add Set", emoji="↩️", style=discord.ButtonStyle.secondary)
+    async def readd_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if self.item.set_number and self.bot.db.get_item_by_set_number(self.item.set_number) is None:
+            self.bot.db.add_item(
+                name=self.item.name,
+                rrp_gbp=self.item.rrp_gbp,
+                set_number=self.item.set_number,
+                category=self.item.category,
+                target_price_gbp=self.item.target_price_gbp,
+                min_discount_pct=self.item.min_discount_pct,
+                url=self.item.url,
+                retailer=self.item.retailer,
+                is_retiring=self.item.is_retiring,
+                image_url=self.item.image_url,
+                notify_user_ids=self.item.notify_user_ids,
+            )
+            upsert_wishlist_entry(
+                self.bot.config.wishlist_path,
+                {
+                    "name": self.item.name,
+                    "set_number": self.item.set_number,
+                    "category": self.item.category,
+                    "rrp_gbp": self.item.rrp_gbp if self.item.rrp_gbp > 0 else None,
+                    "target_price_gbp": self.item.target_price_gbp,
+                    "min_discount_pct": self.item.min_discount_pct,
+                    "is_retiring": self.item.is_retiring,
+                    "image_url": self.item.image_url,
+                    "notify_user_ids": list(self.item.notify_user_ids),
+                },
+            )
+        button.disabled = True
+        button.label = "Re-added"
+        await interaction.response.edit_message(view=self)
+
+
+def is_admin_user(interaction: discord.Interaction, owner_user_id: int) -> bool:
+    """Return True if the user is a Discord server Administrator or the configured bot owner."""
+    if interaction.user.id == owner_user_id:
+        return True
+    if isinstance(interaction.user, discord.Member):
+        return interaction.user.guild_permissions.administrator
+    return False
+
+
 class LegoTrackerBot(discord.Client):
     def __init__(self, config: Config) -> None:
         intents = discord.Intents.default()
@@ -431,7 +484,7 @@ class LegoTrackerBot(discord.Client):
         self.dev_mode: bool = self.db.get_dev_mode(default=env_dev)
 
     def _startup_sync_and_clean(self) -> None:
-        """Sync wishlist.json into SQLite, clean legacy set titles, and purge poisoned history."""
+        """Sync wishlist.json into SQLite, clean legacy set titles, and purge poisoned/old history."""
         entries = load_wishlist_entries(self.config.wishlist_path)
         for entry in entries:
             set_num = str(entry.get("set_number") or "").strip() or None
@@ -465,10 +518,12 @@ class LegoTrackerBot(discord.Client):
                     )
 
         deleted_rows, reset_items = self.db.purge_implausible_history()
-        if deleted_rows or reset_items:
+        pruned_old = self.db.prune_old_history(retention_days=180)
+        if deleted_rows or reset_items or pruned_old:
             logger.info(
-                "Startup DB cleanup removed %d implausible history row(s) and reset %d poisoned alert(s)",
+                "Startup DB cleanup removed %d implausible row(s), pruned %d old row(s), reset %d alert(s)",
                 deleted_rows,
+                pruned_old,
                 reset_items,
             )
 
@@ -508,6 +563,20 @@ class LegoTrackerBot(discord.Client):
     async def price_check_loop(self) -> None:
         try:
             await asyncio.wait_for(self.run_price_checks(scheduled=True), timeout=600.0)
+            outages = pop_long_outage_sources()
+            if outages:
+                channel = self.get_channel(self.config.channel_id)
+                if channel is None:
+                    try:
+                        channel = await self.fetch_channel(self.config.channel_id)
+                    except Exception:
+                        channel = None
+                if isinstance(channel, discord.abc.Messageable):
+                    stores = ", ".join(f"`{s}`" for s in outages)
+                    await channel.send(
+                        content=f"⚠️ **Store Health Notice:** {stores} has been returning errors/blocks for >2 hours.",
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
         except Exception as exc:
             logger.error("Scheduled price check failed: %s", exc)
 
@@ -518,6 +587,7 @@ class LegoTrackerBot(discord.Client):
     async def _maybe_send_weekly_summary(self, channel: object) -> None:
         if not self.db.should_send_weekly_summary() or not isinstance(channel, discord.abc.Messageable):
             return
+        self.db.prune_old_history(retention_days=180)
         lines = []
         for item in self.db.list_items():
             hist = self.db.get_price_history(item.id, limit=1)
@@ -659,9 +729,11 @@ class LegoTrackerBot(discord.Client):
                                 )
                                 retired_content = f"{pings} **{title}** has been removed from your wishlist as it has **retired**."
                                 allowed = discord.AllowedMentions.all()
+                            retired_view = RetiredSetView(self, item)
                             await channel.send(
                                 content=retired_content,
                                 embed=retired_embed,
+                                view=retired_view,
                                 allowed_mentions=allowed,
                             )
                         await _emit(retired_embed)
@@ -1066,6 +1138,15 @@ class LegoTrackerBot(discord.Client):
             set_number: Optional[str] = None,
             force: bool = False,
         ) -> None:
+            if not set_number and not is_admin_user(interaction, self.config.user_id):
+                await interaction.response.send_message(
+                    embed=make_error_embed(
+                        "Admin Only",
+                        "Checking the **entire** wishlist at once is restricted to server admins. Please pick a specific `set_number` instead!",
+                    ),
+                    ephemeral=True,
+                )
+                return
             await interaction.response.defer()
             try:
                 async def _send_one(embed: discord.Embed, view: Optional[discord.ui.View] = None) -> None:
@@ -1349,6 +1430,15 @@ class LegoTrackerBot(discord.Client):
         @app_commands.describe(set_number="Optional specific LEGO set number to check")
         @app_commands.autocomplete(set_number=_set_number_autocomplete)
         async def item_check(interaction: discord.Interaction, set_number: Optional[str] = None) -> None:
+            if not set_number and not is_admin_user(interaction, self.config.user_id):
+                await interaction.response.send_message(
+                    embed=make_error_embed(
+                        "Admin Only",
+                        "Checking **all** sets at once is restricted to server admins. Please pick a specific `set_number` instead!",
+                    ),
+                    ephemeral=True,
+                )
+                return
             await interaction.response.defer()
             try:
                 async def _send_one(embed: discord.Embed, view: Optional[discord.ui.View] = None) -> None:
@@ -1447,8 +1537,14 @@ class LegoTrackerBot(discord.Client):
             file = discord.File(io.BytesIO(chart_bytes), filename="chart.png")
             await interaction.response.send_message(embed=embed, file=file)
 
-        @bot_group.command(name="status", description="Show bot schedule, UK retailer engine, monthly token quota, and source health")
+        @bot_group.command(name="status", description="Show bot schedule, UK retailer engine, monthly token quota, and source health (Admin only)")
         async def bot_status(interaction: discord.Interaction) -> None:
+            if not is_admin_user(interaction, self.config.user_id):
+                await interaction.response.send_message(
+                    embed=make_error_embed("Admin Only", "Only server admins can use `/bot` commands."),
+                    ephemeral=True,
+                )
+                return
             items = self.db.list_items()
             retiring_count = sum(1 for i in items if i.is_retiring)
             cached_count, cache_ttl = get_price_cache_stats()
@@ -1497,9 +1593,15 @@ class LegoTrackerBot(discord.Client):
             )
             await interaction.response.send_message(embed=embed)
 
-        @bot_group.command(name="devmode", description="Toggle dev mode (suppresses user pings on alerts and summaries)")
+        @bot_group.command(name="devmode", description="Toggle dev mode (suppresses user pings on alerts and summaries) (Admin only)")
         @app_commands.describe(enabled="Set True to enable or False to disable (leave blank to toggle)")
         async def bot_devmode(interaction: discord.Interaction, enabled: Optional[bool] = None) -> None:
+            if not is_admin_user(interaction, self.config.user_id):
+                await interaction.response.send_message(
+                    embed=make_error_embed("Admin Only", "Only server admins can use `/bot` commands."),
+                    ephemeral=True,
+                )
+                return
             self.dev_mode = (not self.dev_mode) if enabled is None else enabled
             self.db.set_dev_mode(self.dev_mode)
             state = "ON (pings suppressed)" if self.dev_mode else "OFF (normal pings enabled)"
@@ -1511,21 +1613,35 @@ class LegoTrackerBot(discord.Client):
             )
             await interaction.response.send_message(embed=embed)
 
-        @bot_group.command(name="clean_history", description="Purge bogus/outlier historical prices and reset poisoned alert states")
+        @bot_group.command(name="clean_history", description="Purge bogus/outlier historical prices and reset poisoned alert states (Admin only)")
         async def bot_clean_history(interaction: discord.Interaction) -> None:
+            if not is_admin_user(interaction, self.config.user_id):
+                await interaction.response.send_message(
+                    embed=make_error_embed("Admin Only", "Only server admins can use `/bot` commands."),
+                    ephemeral=True,
+                )
+                return
             deleted_rows, reset_items = self.db.purge_implausible_history()
+            pruned_old = self.db.prune_old_history(retention_days=180)
             embed = make_status_embed(
                 "🧹 Price History Cleaned",
                 (
                     f"• **Removed outlier/unverified history rows:** {deleted_rows}\n"
+                    f"• **Pruned rows older than 180 days:** {pruned_old}\n"
                     f"• **Reset poisoned alert states:** {reset_items}"
                 ),
                 color=discord.Color.green(),
             )
             await interaction.response.send_message(embed=embed)
 
-        @bot_group.command(name="update", description="Pull the latest code from GitHub, sync dependencies, and restart the bot")
+        @bot_group.command(name="update", description="Pull the latest code from GitHub, sync dependencies, and restart the bot (Admin only)")
         async def bot_update(interaction: discord.Interaction) -> None:
+            if not is_admin_user(interaction, self.config.user_id):
+                await interaction.response.send_message(
+                    embed=make_error_embed("Admin Only", "Only server admins can use `/bot` commands."),
+                    ephemeral=True,
+                )
+                return
             await interaction.response.defer()
             try:
                 proc = await asyncio.wait_for(

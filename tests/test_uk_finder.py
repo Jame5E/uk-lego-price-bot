@@ -6,7 +6,11 @@ from src.lego_bot.deal_filter import is_valid_lego_set_listing
 from src.lego_bot.shipping import APPROVED_UK_RETAILERS, UKRetailer
 from src.lego_bot.uk_finder import (
     _PRICE_CACHE,
+    _SOURCE_FIRST_FAIL_AT,
+    _SOURCE_OUTAGE_ALERTED,
     UKOffer,
+    _record_source_block,
+    _record_source_ok,
     build_lego_uk_product_url,
     build_uk_search_urls,
     clean_set_display_name,
@@ -19,6 +23,7 @@ from src.lego_bot.uk_finder import (
     parse_argos_search_html,
     parse_john_lewis_search_html,
     parse_serpapi_shopping_payload,
+    pop_long_outage_sources,
 )
 
 
@@ -199,3 +204,64 @@ def test_amazon_uk_product_page_verification():
     )
     assert oos_offer is None
     assert oos_bad is True
+
+
+def test_john_lewis_and_argos_ignore_was_rrp_save_and_finance():
+    jl_sale_html = """
+    <html><body>
+      <article>
+        <a href="/lego-technic-42171-mercedes/p111524143">
+          LEGO Technic 42171 Mercedes-AMG F1 W14
+          <s>Was £189.99</s>
+          <span>Save £40.00</span>
+          <p class="Price_price__abc">
+            <span class="price_price__now__xyz">£149.99</span>
+          </p>
+        </a>
+      </article>
+    </body></html>
+    """
+    jl_offers = parse_john_lewis_search_html(jl_sale_html, "42171", rrp_gbp=189.99)
+    assert len(jl_offers) == 1
+    assert jl_offers[0].item_price_gbp == 149.99
+
+    argos_sale_html = """
+    <html><body>
+      <div data-test="component-product-card">
+        <a href="/product/5257195">LEGO Technic Mercedes-AMG F1 W14 Set 42171</a>
+        <span>RRP £189.99</span>
+        <span>Save £40.00</span>
+        <span>from £7.63 per month</span>
+        <div class="ds-c-price">
+          <span class="ds-c-price__price">£149.99</span>
+        </div>
+      </div>
+    </body></html>
+    """
+    argos_offers = parse_argos_search_html(argos_sale_html, "42171", rrp_gbp=189.99, prefer_click_and_collect=True)
+    assert len(argos_offers) == 1
+    assert argos_offers[0].item_price_gbp == 149.99
+
+
+def test_long_outage_alert_fires_once_and_resets():
+    _SOURCE_FIRST_FAIL_AT.clear()
+    _SOURCE_OUTAGE_ALERTED.clear()
+
+    _record_source_block("argos_direct")
+    _SOURCE_FIRST_FAIL_AT["argos_direct"] = time.monotonic() - 7500.0
+    first = pop_long_outage_sources(min_outage_seconds=7200.0)
+    assert first == ["argos_direct"]
+
+    # Second call for the same ongoing outage must not re-alert
+    second = pop_long_outage_sources(min_outage_seconds=7200.0)
+    assert second == []
+
+    # Recovery resets state so a future outage can alert again
+    _record_source_ok("argos_direct")
+    _record_source_block("argos_direct")
+    _SOURCE_FIRST_FAIL_AT["argos_direct"] = time.monotonic() - 7500.0
+    third = pop_long_outage_sources(min_outage_seconds=7200.0)
+    assert third == ["argos_direct"]
+
+    _SOURCE_FIRST_FAIL_AT.clear()
+    _SOURCE_OUTAGE_ALERTED.clear()

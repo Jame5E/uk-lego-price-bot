@@ -99,3 +99,29 @@ def test_items_due_for_check_prioritizes_unchecked_and_retiring():
     due = db.get_items_due_for_check(min_age_hours=4.0, now=now)
     assert [i.set_number for i in due] == ["10002"]
     db.close()
+
+
+def test_prune_old_history():
+    db = PriceDatabase(":memory:")
+    item = db.add_item(name="Test Set", rrp_gbp=100.00, set_number="12345")
+    old_ts = (datetime.now(timezone.utc) - timedelta(days=200)).isoformat()
+    recent_ts = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+
+    db._conn.execute(
+        "INSERT INTO price_history (item_id, price_gbp, shipping_gbp, total_gbp, retailer, recorded_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (item.id, 80.00, 0.0, 80.00, "argos", old_ts),
+    )
+    db._conn.execute(
+        "INSERT INTO price_history (item_id, price_gbp, shipping_gbp, total_gbp, retailer, recorded_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (item.id, 85.00, 0.0, 85.00, "argos", recent_ts),
+    )
+    db._conn.commit()
+
+    pruned = db.prune_old_history(retention_days=180)
+    assert pruned == 1
+    remaining = db.get_price_history(item.id)
+    assert len(remaining) == 1
+    assert remaining[0].total_gbp == 85.00
+    db.close()

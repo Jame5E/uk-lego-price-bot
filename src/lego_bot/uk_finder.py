@@ -50,8 +50,11 @@ GENERIC_BRICKSET_SUBTHEMES = {
 
 # Per-source circuit breaker for any direct store that returns repeated 403/429
 _SOURCE_COOLDOWN_SECONDS = 900.0
+_SOURCE_OUTAGE_ALERT_SECONDS = 7200.0
 _SOURCE_FAIL_STREAK: dict[str, int] = {}
 _SOURCE_COOLDOWN_UNTIL: dict[str, float] = {}
+_SOURCE_FIRST_FAIL_AT: dict[str, float] = {}
+_SOURCE_OUTAGE_ALERTED: set[str] = set()
 
 
 def _is_source_cooled_down(source_key: str) -> bool:
@@ -65,15 +68,30 @@ def _is_source_cooled_down(source_key: str) -> bool:
 
 
 def _record_source_block(source_key: str) -> None:
+    now = time.monotonic()
+    _SOURCE_FIRST_FAIL_AT.setdefault(source_key, now)
     streak = _SOURCE_FAIL_STREAK.get(source_key, 0) + 1
     _SOURCE_FAIL_STREAK[source_key] = streak
     if streak >= 2:
-        _SOURCE_COOLDOWN_UNTIL[source_key] = time.monotonic() + _SOURCE_COOLDOWN_SECONDS
+        _SOURCE_COOLDOWN_UNTIL[source_key] = now + _SOURCE_COOLDOWN_SECONDS
 
 
 def _record_source_ok(source_key: str) -> None:
     _SOURCE_FAIL_STREAK.pop(source_key, None)
     _SOURCE_COOLDOWN_UNTIL.pop(source_key, None)
+    _SOURCE_FIRST_FAIL_AT.pop(source_key, None)
+    _SOURCE_OUTAGE_ALERTED.discard(source_key)
+
+
+def pop_long_outage_sources(min_outage_seconds: float = _SOURCE_OUTAGE_ALERT_SECONDS) -> list[str]:
+    """Return source keys that have been continuously failing for >= min_outage_seconds (once per outage)."""
+    now = time.monotonic()
+    outages: list[str] = []
+    for key, started_at in list(_SOURCE_FIRST_FAIL_AT.items()):
+        if key not in _SOURCE_OUTAGE_ALERTED and (now - started_at) >= min_outage_seconds:
+            _SOURCE_OUTAGE_ALERTED.add(key)
+            outages.append(key)
+    return outages
 
 
 # In-memory price cache (30 minutes) to keep `/wishlist check` instant and save resources
@@ -321,7 +339,7 @@ async def _lookup_brickset_public(
             theme = val
         elif label == "subtheme":
             subtheme = val
-        elif label in ("availability", "notes"):
+        elif label == "availability":
             availability_val += " " + val.lower()
         elif label in ("exit date", "launch/exit"):
             availability_val += " " + val.lower()
@@ -664,6 +682,43 @@ def parse_amazon_uk_product_html(
         soup.decompose()
 
 
+def _extract_current_card_price(
+    card: Any,
+    *,
+    preferred_selectors: tuple[str, ...],
+    set_number: str,
+    title_text: str,
+    rrp_gbp: float | None = None,
+) -> float | None:
+    """Extract the current (sale) GBP price from a retailer card, ignoring Was/RRP/Save/finance text."""
+    # 1. Try explicit current-price CSS selectors first
+    for sel in preferred_selectors:
+        for el in card.select(sel):
+            el_txt = el.get_text(" ", strip=True)
+            if any(bad in el_txt.lower() for bad in ("was", "rrp", "save", "per month")):
+                continue
+            m = re.search(r"£\s*(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)", el_txt)
+            if m:
+                val = round(float(m.group(1).replace(",", "")), 2)
+                if is_valid_lego_set_listing(title_text, set_number, val, rrp_gbp):
+                    return val
+
+    # 2. Fallback: strip strikethrough tags & Was/Save/RRP/finance phrases, then pick lowest valid price
+    for strike in card.select("s, del, [class*='was'], [data-test*='was']"):
+        strike.decompose()
+
+    cleaned = card.get_text(" ", strip=True)
+    cleaned = re.sub(r"from\s*£\s*\d+(?:\.\d{2})?\s*per\s*month", " ", cleaned, flags=re.I)
+    cleaned = re.sub(r"\b(?:was|rrp|save)\s*:?\s*£\s*\d{1,4}(?:,\d{3})*(?:\.\d{2})?", " ", cleaned, flags=re.I)
+
+    candidates: list[float] = []
+    for raw in re.findall(r"£\s*(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)", cleaned):
+        val = round(float(raw.replace(",", "")), 2)
+        if is_valid_lego_set_listing(title_text, set_number, val, rrp_gbp):
+            candidates.append(val)
+    return min(candidates) if candidates else None
+
+
 def parse_john_lewis_search_html(
     html: str,
     set_number: str,
@@ -684,11 +739,18 @@ def parse_john_lewis_search_html(
                 continue
             if any(p in text.lower() for p in OUT_OF_STOCK_PHRASES):
                 continue
-            m = re.search(r"£\s*(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)", text)
-            if not m:
-                continue
-            price = round(float(m.group(1).replace(",", "")), 2)
-            if not is_valid_lego_set_listing(text, clean_num, price, rrp_gbp):
+            price = _extract_current_card_price(
+                article,
+                preferred_selectors=(
+                    "span[class*='price_price__now']",
+                    "[data-test='product-card-price']",
+                    "p[class*='Price_price']",
+                ),
+                set_number=clean_num,
+                title_text=text,
+                rrp_gbp=rrp_gbp,
+            )
+            if price is None:
                 continue
             link_tag = article.find("a", href=True)
             href = str(link_tag["href"]).strip() if link_tag else ""
@@ -732,13 +794,18 @@ def parse_argos_search_html(
                 continue
             if any(p in text.lower() for p in OUT_OF_STOCK_PHRASES):
                 continue
-            # Strip monthly finance text ("from £7.63 per month") before matching item price
-            cleaned_text = re.sub(r"from\s*£\s*\d+(?:\.\d{2})?\s*per\s*month", "", text, flags=re.I)
-            m = re.search(r"£\s*(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)", cleaned_text)
-            if not m:
-                continue
-            price = round(float(m.group(1).replace(",", "")), 2)
-            if not is_valid_lego_set_listing(cleaned_text, clean_num, price, rrp_gbp):
+            price = _extract_current_card_price(
+                card,
+                preferred_selectors=(
+                    "span.ds-c-price__price",
+                    "[data-test='component-product-card-price']",
+                    "div.ds-c-price",
+                ),
+                set_number=clean_num,
+                title_text=text,
+                rrp_gbp=rrp_gbp,
+            )
+            if price is None:
                 continue
             link_tag = card.find("a", href=re.compile(r"^/product/\d+")) or card.find("a", href=True)
             href = str(link_tag["href"]).strip() if link_tag else ""

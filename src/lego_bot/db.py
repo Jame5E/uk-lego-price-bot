@@ -399,6 +399,13 @@ class PriceDatabase:
         self._conn.commit()
         return deleted_rows, reset_items
 
+    def prune_old_history(self, retention_days: int = 180) -> int:
+        """Delete price_history rows older than retention_days to keep SQLite compact."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
+        cur = self._conn.execute("DELETE FROM price_history WHERE recorded_at < ?", (cutoff,))
+        self._conn.commit()
+        return cur.rowcount
+
     # --- Persisted Dev Mode ---
 
     def get_dev_mode(self, default: bool = False) -> bool:
