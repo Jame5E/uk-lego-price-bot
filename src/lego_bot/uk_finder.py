@@ -418,10 +418,21 @@ def _parse_lego_uk_retiring(html: str) -> bool:
     if not html:
         return False
     lower = html.lower()
-    if '"retiringsoon":true' in lower or '"availabilitystatus":"retiringsoon"' in lower:
+    if any(
+        tok in lower
+        for tok in (
+            '"retiringsoon":true',
+            '"isretiringsoon":true',
+            '"availabilitystatus":"retiringsoon"',
+            '"availabilitytext":"retiring soon"',
+            '"flag":"retiring soon"',
+            '"productflag":"retiring soon"',
+            '"badge":"retiring soon"',
+        )
+    ):
         return True
     soup = BeautifulSoup(html, "html.parser")
-    for el in soup.find_all(["span", "div", "p", "strong"], limit=1500):
+    for el in soup.find_all(["span", "div", "p", "strong"]):
         txt = el.get_text(" ", strip=True).lower()
         if txt in ("retiring soon", "retiring soon!"):
             soup.decompose()
