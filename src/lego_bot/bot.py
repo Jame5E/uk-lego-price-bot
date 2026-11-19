@@ -853,7 +853,9 @@ class LegoTrackerBot(discord.Client):
 
                 title = format_item_title(item)
                 box_art = item.image_url or default_box_art_url(item.set_number)
-                cat_line = f"📂 **Category:** {item.category}\n" if item.category else ""
+                cat_part = f"📂 **Category:** {item.category}\n" if item.category else ""
+                retiring_line = "⚠️ **Status:** Retiring Soon\n" if is_retiring else ""
+                cat_line = f"{cat_part}{retiring_line}"
 
                 if best_offer is None:
                     # During 0-token interactive checks, fall back to latest verified UK retailer price if recorded
