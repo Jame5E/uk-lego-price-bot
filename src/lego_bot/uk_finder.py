@@ -1327,26 +1327,6 @@ async def find_best_uk_offer(
                 ),
             )
         )
-        tasks.append(
-            _fetch_direct_uk_store(
-                session,
-                source_key="argos",
-                label="Argos",
-                url=f"https://www.argos.co.uk/search/lego-{clean_num}/",
-                parser_fn=lambda html: parse_argos_search_html(
-                    html, clean_num, rrp_gbp=rrp_gbp, prefer_click_and_collect=prefer_click_and_collect
-                ),
-            )
-        )
-        tasks.append(
-            _fetch_direct_uk_store(
-                session,
-                source_key="disney_store",
-                label="Disney Store UK",
-                url=f"https://www.disneystore.co.uk/search?q=lego+{clean_num}",
-                parser_fn=lambda html: parse_disney_store_search_html(html, clean_num, rrp_gbp=rrp_gbp),
-            )
-        )
 
     if direct_url and match_approved_uk_retailer(direct_url) is not None:
         async def _check_direct() -> tuple[list[UKOffer], str | None]:
