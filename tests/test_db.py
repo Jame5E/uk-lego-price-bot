@@ -125,3 +125,13 @@ def test_prune_old_history():
     assert len(remaining) == 1
     assert remaining[0].total_gbp == 85.00
     db.close()
+
+
+def test_amazon_dp_url_persistence():
+    db = PriceDatabase(":memory:")
+    assert db.get_amazon_dp_urls() == {}
+    db.set_amazon_dp_url("42171-1", "https://www.amazon.co.uk/dp/B0CFVZ74KT")
+    assert db.get_amazon_dp_urls() == {"42171": "https://www.amazon.co.uk/dp/B0CFVZ74KT"}
+    db.set_amazon_dp_url("42171", None)
+    assert db.get_amazon_dp_urls() == {}
+    db.close()

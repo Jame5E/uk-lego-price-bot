@@ -29,6 +29,7 @@ from .uk_finder import (
     find_best_uk_offer,
     get_price_cache_stats,
     get_source_health,
+    load_amazon_dp_urls,
     lookup_set_metadata,
     pop_finished_cooldowns,
     pop_long_outage_sources,
@@ -489,6 +490,7 @@ class LegoTrackerBot(discord.Client):
 
     def _startup_sync_and_clean(self) -> None:
         """Sync wishlist.json into SQLite, clean legacy set titles, and purge poisoned/old history."""
+        load_amazon_dp_urls(self.db.get_amazon_dp_urls())
         entries = load_wishlist_entries(self.config.wishlist_path)
         for entry in entries:
             set_num = str(entry.get("set_number") or "").strip() or None
@@ -826,6 +828,7 @@ class LegoTrackerBot(discord.Client):
                     serpapi_key=self.config.serpapi_key,
                     allow_serpapi=allow_serpapi,
                     on_serpapi_credit_used=lambda: self.db.increment_monthly_usage("serpapi"),
+                    on_amazon_dp_url_update=self.db.set_amazon_dp_url,
                     proxy_url=self.config.proxy_url,
                     force_refresh=force_refresh,
                 )

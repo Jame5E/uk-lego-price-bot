@@ -177,6 +177,13 @@ def clear_price_cache() -> int:
     return count
 
 
+def load_amazon_dp_urls(urls: dict[str, str]) -> None:
+    """Preload persisted Amazon /dp/{asin} URLs from SQLite on bot startup."""
+    for set_num, url in urls.items():
+        if set_num and url:
+            _AMAZON_DP_URL_CACHE[set_num.strip().split("-")[0]] = url
+
+
 @dataclass(frozen=True)
 class SetMetadata:
     name: str | None
@@ -958,29 +965,47 @@ async def _fetch_direct_uk_store(
 ) -> tuple[list[UKOffer], str | None]:
     if _is_source_cooled_down(source_key):
         return [], f"{label}: skipped (cooldown)"
-    try:
-        status, html = await _http_get_html(session, url, cookies=cookies, timeout_seconds=10.0)
-        if status != 200:
-            if status in (202, 403, 429, 503):
-                _record_source_block(source_key)
-            return [], f"{label}: HTTP {status}"
-        html_lower = html.lower()
-        if (
-            "validatecaptcha" in html_lower
-            or "enter the characters you see below" in html_lower
-            or "api-services-support@amazon" in html_lower
-            or "sorry, we just need to make sure you're not a robot" in html_lower
-            or (source_key == "amazon_uk" and 'data-component-type="s-search-result"' not in html)
-        ):
-            _record_source_block(source_key)
-            return [], f"{label}: rate-limited"
-    except Exception as exc:
-        _record_source_block(source_key)
-        return [], f"{label}: {type(exc).__name__}"
 
-    _record_source_ok(source_key)
-    found = parser_fn(html)
-    return found, (None if found else f"{label}: not in stock / not listed")
+    for attempt in range(2):
+        try:
+            status, html = await _http_get_html(session, url, cookies=cookies, timeout_seconds=10.0)
+            if status != 200:
+                if status in (429, 503) and attempt == 0:
+                    _rotate_curl_profile()
+                    await asyncio.sleep(2.0)
+                    continue
+                if status in (202, 403, 429, 503):
+                    _record_source_block(source_key)
+                return [], f"{label}: HTTP {status}"
+
+            html_lower = html.lower()
+            is_soft_block = (
+                "validatecaptcha" in html_lower
+                or "enter the characters you see below" in html_lower
+                or "api-services-support@amazon" in html_lower
+                or "sorry, we just need to make sure you're not a robot" in html_lower
+                or (source_key == "amazon_uk" and 'data-component-type="s-search-result"' not in html)
+            )
+            if is_soft_block:
+                if attempt == 0:
+                    _rotate_curl_profile()
+                    await asyncio.sleep(2.0)
+                    continue
+                _record_source_block(source_key)
+                return [], f"{label}: rate-limited"
+
+            _record_source_ok(source_key)
+            found = parser_fn(html)
+            return found, (None if found else f"{label}: not in stock / not listed")
+        except Exception as exc:
+            if attempt == 0:
+                _rotate_curl_profile()
+                await asyncio.sleep(2.0)
+                continue
+            _record_source_block(source_key)
+            return [], f"{label}: {type(exc).__name__}"
+
+    return [], f"{label}: rate-limited"
 
 
 # --- Layer 2: SerpApi Google Shopping UK (Covers all 8 Approved UK Stores) ---
@@ -1109,10 +1134,11 @@ async def find_best_uk_offer(
     serpapi_key: str | None = None,
     allow_serpapi: bool = True,
     on_serpapi_credit_used: Callable[[], None] | None = None,
+    on_amazon_dp_url_update: Callable[[str, str | None], None] | None = None,
     proxy_url: str | None = None,
     force_refresh: bool = False,
 ) -> tuple[UKOffer | None, list[str]]:
-    """Check approved UK retailers concurrently (0-token direct stores + quota-governed Google Shopping UK)
+    """Check approved UK retailers concurrently (0-token direct stores + blocked-only Google Shopping UK fallback)
     and return the cheapest genuine in-stock landed GBP offer."""
     clean_key_id = set_number.strip().split("-")[0] if set_number else name.strip().lower()
     cache_key = f"{clean_key_id}|{int(has_amazon_prime)}|{int(prefer_click_and_collect)}|{direct_url or ''}"
@@ -1128,6 +1154,7 @@ async def find_best_uk_offer(
     tasks = []
 
     used_direct_dp = False
+    clean_num: str | None = None
     if set_number:
         clean_num = set_number.strip().split("-")[0]
         cached_dp_url = _AMAZON_DP_URL_CACHE.get(clean_num)
@@ -1136,49 +1163,68 @@ async def find_best_uk_offer(
 
         if cached_dp_url:
             used_direct_dp = True
+            target_clean_num = clean_num
 
             async def _fetch_amazon_dp_direct() -> tuple[list[UKOffer], str | None]:
                 if _is_source_cooled_down("amazon_uk"):
                     return [], "Amazon UK: skipped (cooldown)"
-                try:
-                    status, dp_html = await _http_get_html(
-                        session,
-                        cached_dp_url,
-                        cookies={"i18n-prefs": "GBP"},
-                        timeout_seconds=10.0,
-                    )
-                    if status == 404:
-                        _AMAZON_DP_URL_CACHE.pop(clean_num, None)
-                        return [], "Amazon UK: product page 404"
-                    if status != 200:
-                        if status in (202, 403, 429, 503):
+                for attempt in range(2):
+                    try:
+                        status, dp_html = await _http_get_html(
+                            session,
+                            cached_dp_url,
+                            cookies={"i18n-prefs": "GBP"},
+                            timeout_seconds=10.0,
+                        )
+                        if status == 404:
+                            _AMAZON_DP_URL_CACHE.pop(target_clean_num, None)
+                            if on_amazon_dp_url_update is not None:
+                                on_amazon_dp_url_update(target_clean_num, None)
+                            return [], "Amazon UK: product page 404"
+                        if status != 200:
+                            if status in (429, 503) and attempt == 0:
+                                _rotate_curl_profile()
+                                await asyncio.sleep(2.0)
+                                continue
+                            if status in (202, 403, 429, 503):
+                                _record_source_block("amazon_uk")
+                            return [], f"Amazon UK: HTTP {status}"
+                        dp_lower = dp_html.lower()
+                        if (
+                            "validatecaptcha" in dp_lower
+                            or "enter the characters you see below" in dp_lower
+                            or "api-services-support@amazon" in dp_lower
+                        ):
+                            if attempt == 0:
+                                _rotate_curl_profile()
+                                await asyncio.sleep(2.0)
+                                continue
                             _record_source_block("amazon_uk")
-                        return [], f"Amazon UK: HTTP {status}"
-                    dp_lower = dp_html.lower()
-                    if (
-                        "validatecaptcha" in dp_lower
-                        or "enter the characters you see below" in dp_lower
-                        or "api-services-support@amazon" in dp_lower
-                    ):
+                            return [], "Amazon UK: rate-limited"
+                        _record_source_ok("amazon_uk")
+                        verified, definitively_bad = parse_amazon_uk_product_html(
+                            dp_html,
+                            cached_dp_url,
+                            target_clean_num,
+                            rrp_gbp=rrp_gbp,
+                            has_amazon_prime=has_amazon_prime,
+                        )
+                        if verified is not None:
+                            return [verified], None
+                        if definitively_bad:
+                            _AMAZON_DP_URL_CACHE.pop(target_clean_num, None)
+                            if on_amazon_dp_url_update is not None:
+                                on_amazon_dp_url_update(target_clean_num, None)
+                            return [], "Amazon UK: out of stock"
+                        return [], "Amazon UK: not in stock / not listed"
+                    except Exception as exc:
+                        if attempt == 0:
+                            _rotate_curl_profile()
+                            await asyncio.sleep(2.0)
+                            continue
                         _record_source_block("amazon_uk")
-                        return [], "Amazon UK: rate-limited"
-                    _record_source_ok("amazon_uk")
-                    verified, definitively_bad = parse_amazon_uk_product_html(
-                        dp_html,
-                        cached_dp_url,
-                        clean_num,
-                        rrp_gbp=rrp_gbp,
-                        has_amazon_prime=has_amazon_prime,
-                    )
-                    if verified is not None:
-                        return [verified], None
-                    if definitively_bad:
-                        _AMAZON_DP_URL_CACHE.pop(clean_num, None)
-                        return [], "Amazon UK: out of stock"
-                    return [], "Amazon UK: not in stock / not listed"
-                except Exception as exc:
-                    _record_source_block("amazon_uk")
-                    return [], f"Amazon UK: {type(exc).__name__}"
+                        return [], f"Amazon UK: {type(exc).__name__}"
+                return [], "Amazon UK: rate-limited"
 
             tasks.append(_fetch_amazon_dp_direct())
         else:
@@ -1226,19 +1272,6 @@ async def find_best_uk_offer(
             )
         )
 
-        if serpapi_key and allow_serpapi:
-            tasks.append(
-                _fetch_serpapi_google_shopping_uk(
-                    session,
-                    clean_num,
-                    serpapi_key,
-                    rrp_gbp=rrp_gbp,
-                    has_amazon_prime=has_amazon_prime,
-                    prefer_click_and_collect=prefer_click_and_collect,
-                    on_credit_used=on_serpapi_credit_used,
-                )
-            )
-
     if direct_url and match_approved_uk_retailer(direct_url) is not None:
         async def _check_direct() -> tuple[list[UKOffer], str | None]:
             res = await fetch_price_for_url(session, direct_url)
@@ -1277,6 +1310,25 @@ async def find_best_uk_offer(
         if err:
             notes.append(err)
 
+    # SerpApi blocked-only fallback: only spend a credit if direct stores had a block/cooldown or found nothing
+    any_blocked = any(
+        any(tok in n.lower() for tok in ("rate-limited", "cooldown", "http 503", "http 403", "http 429"))
+        for n in notes
+    )
+    if clean_num and serpapi_key and allow_serpapi and (not offers or any_blocked):
+        serp_offers, serp_err = await _fetch_serpapi_google_shopping_uk(
+            session,
+            clean_num,
+            serpapi_key,
+            rrp_gbp=rrp_gbp,
+            has_amazon_prime=has_amazon_prime,
+            prefer_click_and_collect=prefer_click_and_collect,
+            on_credit_used=on_serpapi_credit_used,
+        )
+        offers.extend(o for o in serp_offers if o.retailer in APPROVED_UK_RETAILERS)
+        if serp_err:
+            notes.append(serp_err)
+
     if not offers:
         return None, notes
 
@@ -1288,10 +1340,9 @@ async def find_best_uk_offer(
         not used_direct_dp
         and best.retailer == UKRetailer.AMAZON_UK
         and "/dp/" in best.url
-        and set_number
+        and clean_num
         and not _is_source_cooled_down("amazon_uk")
     ):
-        clean_num = set_number.strip().split("-")[0]
         try:
             status, dp_html = await _http_get_html(
                 session,
@@ -1319,8 +1370,10 @@ async def find_best_uk_offer(
         except Exception:
             pass  # Fail open to search-card offer if /dp/ check times out
 
-    if set_number and best.retailer == UKRetailer.AMAZON_UK and "/dp/" in best.url:
-        _AMAZON_DP_URL_CACHE[set_number.strip().split("-")[0]] = best.url
+    if clean_num and best.retailer == UKRetailer.AMAZON_UK and "/dp/" in best.url:
+        _AMAZON_DP_URL_CACHE[clean_num] = best.url
+        if on_amazon_dp_url_update is not None:
+            on_amazon_dp_url_update(clean_num, best.url)
 
     _PRICE_CACHE[cache_key] = (time.monotonic(), best, list(notes))
     return best, notes

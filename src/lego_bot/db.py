@@ -426,6 +426,40 @@ class PriceDatabase:
         )
         self._conn.commit()
 
+    def get_amazon_dp_urls(self) -> dict[str, str]:
+        row = self._conn.execute(
+            "SELECT value FROM bot_state WHERE key = 'amazon_dp_urls'"
+        ).fetchone()
+        if not row or not row["value"]:
+            return {}
+        try:
+            data = json.loads(row["value"])
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items() if k and v}
+        except Exception:
+            pass
+        return {}
+
+    def set_amazon_dp_url(self, set_number: str, url: str | None) -> None:
+        clean_num = set_number.strip().split("-")[0]
+        urls = self.get_amazon_dp_urls()
+        if url:
+            if urls.get(clean_num) == url:
+                return
+            urls[clean_num] = url
+        else:
+            if clean_num not in urls:
+                return
+            urls.pop(clean_num, None)
+        self._conn.execute(
+            """
+            INSERT INTO bot_state (key, value) VALUES ('amazon_dp_urls', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (json.dumps(urls),),
+        )
+        self._conn.commit()
+
     # --- Monthly Token Quota Governor ---
 
     def get_monthly_usage(self, provider: str, now: datetime | None = None) -> int:

@@ -356,3 +356,37 @@ def test_tiered_cooldowns_and_profile_rotation_and_dp_cache():
     _record_source_block("argos")
     assert _uk_mod.clear_cooldowns() == ["Argos"]
     assert _uk_mod.clear_cooldowns() == []
+
+
+def test_fetch_direct_retries_once_on_503_and_recovers():
+    from unittest.mock import AsyncMock, patch
+
+    _uk_mod.clear_cooldowns()
+    amz_html = """
+    <html><body>
+      <span id="glow-ingress-line2">United Kingdom</span>
+      <div data-component-type="s-search-result" data-asin="B0CFVZ74KT">
+        <h2>LEGO</h2>
+        <h2>Technic Mercedes-AMG F1 W14 E Performance 42171</h2>
+        <span class="a-price"><span class="a-offscreen">£138.98</span></span>
+      </div>
+    </body></html>
+    """
+    mock_get = AsyncMock(side_effect=[(503, "Service Unavailable"), (200, amz_html)])
+    with patch("src.lego_bot.uk_finder._http_get_html", new=mock_get), patch(
+        "src.lego_bot.uk_finder.asyncio.sleep", new=AsyncMock()
+    ):
+        offers, err = asyncio.run(
+            _uk_mod._fetch_direct_uk_store(
+                None,
+                source_key="amazon_uk",
+                label="Amazon UK",
+                url="https://www.amazon.co.uk/s?k=LEGO+42171",
+                parser_fn=lambda html: parse_amazon_uk_search_html(html, "42171", rrp_gbp=189.99),
+            )
+        )
+    assert err is None
+    assert len(offers) == 1
+    assert offers[0].item_price_gbp == 138.98
+    assert mock_get.await_count == 2
+    assert "amazon_uk" not in _uk_mod._SOURCE_FAIL_STREAK
