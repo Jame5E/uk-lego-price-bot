@@ -1341,7 +1341,7 @@ class LegoTrackerBot(discord.Client):
                 if last_dt is not None:
                     ts = int(last_dt.timestamp())
                     checked_line = f"🕒 **Last Checked:** <t:{ts}:R> (<t:{ts}:f>)"
-                    min_age_s = (4.0 / 1.5 if item.is_retiring else 4.0) * 3600.0
+                    min_age_s = 4.0 * 3600.0
                     due_ts = int(last_dt.timestamp() + min_age_s)
                     due_line = (
                         "⏳ **Queue Status:** Due now"
@@ -1361,7 +1361,7 @@ class LegoTrackerBot(discord.Client):
                 else:
                     price_line = "🏷️ **Latest Price:** *No price recorded yet*"
 
-                retire_line = "\n⚠️ **Status:** Retiring Soon (1.5× priority)" if item.is_retiring else ""
+                retire_line = "\n⚠️ **Status:** Retiring Soon" if item.is_retiring else ""
                 embed = make_status_embed(
                     f"🕒 {format_item_title(item)}",
                     f"{checked_line}\n{price_line}\n{due_line}{retire_line}",

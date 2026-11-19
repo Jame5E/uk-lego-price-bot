@@ -559,8 +559,8 @@ class PriceDatabase:
         min_age_hours: float = 4.0,
         now: datetime | None = None,
     ) -> list[TrackedItem]:
-        """Return wishlist items due for a background check, longest-since-last-checked first
-        (retiring sets prioritized 1.5x). Never-checked sets come first."""
+        """Return wishlist items due for a background check, longest-since-last-checked first.
+        Never-checked sets come first."""
         dt = now or datetime.now(timezone.utc)
         scored: list[tuple[float, TrackedItem]] = []
         for item in self.list_items():
@@ -570,10 +570,8 @@ class PriceDatabase:
                 continue
             age_hours = (dt - last_checked).total_seconds() / 3600.0
 
-            effective_min = min_age_hours / 1.5 if item.is_retiring else min_age_hours
-            if age_hours >= effective_min:
-                priority = age_hours * (1.5 if item.is_retiring else 1.0)
-                scored.append((priority, item))
+            if age_hours >= min_age_hours:
+                scored.append((age_hours, item))
 
         scored.sort(key=lambda pair: pair[0], reverse=True)
         return [item for _, item in scored]
