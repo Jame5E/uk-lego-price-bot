@@ -88,6 +88,7 @@ async def lookup_set_metadata(
     set_number: str,
     *,
     brickset_api_key: str | None = None,
+    proxy_url: str | None = None,
 ) -> SetMetadata:
     """Auto-discover set name, category, UK RRP (£), box art image, and retiring status."""
     clean_num = set_number.strip().split("-")[0]
@@ -105,7 +106,7 @@ async def lookup_set_metadata(
     if not public_meta.name or not public_meta.rrp_gbp or not public_meta.is_retiring:
         try:
             async with session.get(
-                lego_url, headers=DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=6)
+                lego_url, headers=DEFAULT_HEADERS, proxy=proxy_url, timeout=aiohttp.ClientTimeout(total=6)
             ) as resp:
                 if resp.status == 200:
                     html = await resp.text()
@@ -877,21 +878,6 @@ async def find_best_uk_offer(
                 proxy_url=proxy_url,
             )
         )
-        tasks.append(_fetch_pricerunner_uk(session, set_number, proxy_url=proxy_url))
-
-    for retailer, url in build_uk_search_urls(name, set_number):
-        tasks.append(
-            _check_retailer_url(
-                session,
-                retailer,
-                url,
-                set_number=set_number,
-                has_amazon_prime=has_amazon_prime,
-                prefer_click_and_collect=prefer_click_and_collect,
-                keepa_api_key=keepa_api_key,
-                proxy_url=proxy_url,
-            )
-        )
 
     if direct_url:
         async def _check_direct() -> tuple[list[UKOffer], str | None]:
@@ -930,6 +916,34 @@ async def find_best_uk_offer(
         offers.extend(found_offers)
         if err:
             notes.append(err)
+
+    # Stage 2 fallback: only hit heavy retailer search pages if Stage 1 found nothing
+    if not offers:
+        fallback_tasks = []
+        if set_number:
+            fallback_tasks.append(_fetch_pricerunner_uk(session, set_number, proxy_url=proxy_url))
+        for retailer, url in build_uk_search_urls(name, set_number):
+            fallback_tasks.append(
+                _check_retailer_url(
+                    session,
+                    retailer,
+                    url,
+                    set_number=set_number,
+                    has_amazon_prime=has_amazon_prime,
+                    prefer_click_and_collect=prefer_click_and_collect,
+                    keepa_api_key=keepa_api_key,
+                    proxy_url=proxy_url,
+                )
+            )
+        fb_results = await asyncio.gather(*fallback_tasks, return_exceptions=True)
+        for item in fb_results:
+            if isinstance(item, Exception):
+                notes.append(f"Check error: {type(item).__name__}")
+                continue
+            found_offers, err = item
+            offers.extend(found_offers)
+            if err:
+                notes.append(err)
 
     if not offers:
         return None, notes
