@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import os
 import random
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Awaitable, Callable, Literal, Optional
 
 import aiohttp
@@ -18,10 +20,23 @@ from discord.ext import tasks
 from .chart import generate_price_chart
 from .config import Config
 from .db import PriceDatabase, TrackedItem
+from .embeds import (
+    build_alert_embeds,
+    build_price_card,
+    effective_notify_user_ids,
+    format_discount_badge,
+    format_discount_short,
+    format_item_title,
+    format_pings,
+    make_error_embed,
+    make_status_embed,
+)
 from .predictor import PriceAnalysis, analyze_price
+from .scheduler import build_weekly_summary_embed, format_pinned_dashboard, is_quiet_hours
 from .shipping import APPROVED_UK_RETAILERS, UKRetailer, detect_retailer_from_url
 from .uk_finder import (
     HAS_CURL_CFFI,
+    UKOffer,
     build_uk_search_urls,
     clean_set_display_name,
     clear_cooldowns,
@@ -37,7 +52,30 @@ from .uk_finder import (
     pop_finished_cooldowns,
     pop_long_outage_sources,
 )
+from .views import (
+    CheckResultView,
+    DealLinkView,
+    PingManagerView,
+    RetiredSetView,
+    SetDetailView,
+    WishlistView,
+)
 from .wishlist_store import load_wishlist_entries, remove_wishlist_entry, upsert_wishlist_entry
+
+__all__ = [
+    "LegoTrackerBot",
+    "RetiredSetView",
+    "WishlistView",
+    "SetDetailView",
+    "CheckResultView",
+    "DealLinkView",
+    "PingManagerView",
+    "build_alert_embeds",
+    "format_discount_badge",
+    "format_discount_short",
+    "is_admin_user",
+    "main",
+]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,745 +84,6 @@ logging.basicConfig(
 logger = logging.getLogger("lego_bot")
 
 COMMAND_TIMEOUT_SECONDS = 300.0
-
-
-def format_pings(
-    default_user_id: int,
-    item: TrackedItem,
-    extra_user_ids: tuple[str, ...] = ("942902769319292948",),
-) -> str:
-    ids = list(item.notify_user_ids) if item.notify_user_ids else [str(default_user_id), *extra_user_ids]
-    return " ".join(f"<@{uid}>" for uid in dict.fromkeys(ids))
-
-
-def format_item_title(item: TrackedItem) -> str:
-    display_name = clean_set_display_name(item.name, item.set_number) or item.name
-    if item.set_number and item.set_number not in display_name:
-        return f"{display_name} (#{item.set_number})"
-    return display_name
-
-
-def format_discount_short(discount_pct: float) -> str:
-    """Format a discount percentage cleanly, avoiding '-5% off' when above RRP."""
-    rounded = round(discount_pct)
-    if rounded > 0:
-        return f"-{rounded}%"
-    if rounded == 0:
-        return "at RRP"
-    return f"+{abs(rounded)}% above RRP"
-
-
-def format_discount_badge(discount_pct: float, savings_gbp: float | None = None) -> str:
-    """Format a discount headline badge cleanly for embeds."""
-    rounded = round(discount_pct)
-    if rounded > 0:
-        save_part = f" *(Save £{savings_gbp:.2f})*" if savings_gbp is not None and savings_gbp > 0 else ""
-        return f"**{rounded}% OFF**{save_part}"
-    if rounded == 0:
-        return "**At RRP**"
-    over_part = f" *(+£{abs(savings_gbp):.2f})*" if savings_gbp is not None and savings_gbp < 0 else ""
-    return f"**{abs(rounded)}% above RRP**{over_part}"
-
-
-def make_status_embed(
-    title: str,
-    description: str,
-    *,
-    color: discord.Color | None = None,
-    image_url: str | None = None,
-    footer: str | None = None,
-) -> discord.Embed:
-    embed = discord.Embed(
-        title=title,
-        description=description,
-        color=color or discord.Color.blue(),
-    )
-    if image_url:
-        embed.set_image(url=image_url)
-    if footer:
-        embed.set_footer(text=footer)
-    return embed
-
-
-def make_error_embed(title: str, detail: str) -> discord.Embed:
-    return discord.Embed(
-        title=f"❌ {title}",
-        description=detail,
-        color=discord.Color.red(),
-    )
-
-
-def build_alert_embeds(
-    item: TrackedItem,
-    analysis: PriceAnalysis,
-    retailer: UKRetailer,
-    shipping_note: str,
-    offer_url: str | None = None,
-    *,
-    is_all_time_low: bool = False,
-    has_chart: bool = False,
-    simulated: bool = False,
-) -> list[discord.Embed]:
-    if "BUY NOW" in analysis.verdict:
-        color = discord.Color.green()
-        verdict_icon = "🟢"
-    elif "GOOD DEAL" in analysis.verdict or "BUY SOON" in analysis.verdict:
-        color = discord.Color.gold()
-        verdict_icon = "🟡"
-    else:
-        color = discord.Color.orange()
-        verdict_icon = "🟠"
-
-    title_prefix = "🧪 [TEST] " if simulated else ""
-    atl_badge = "🔥 NEW ALL-TIME LOW! " if is_all_time_low else ""
-    link_url = offer_url or item.url
-    title = format_item_title(item)
-    rrp_part = (
-        f"~~RRP: £{analysis.rrp_gbp:.2f}~~"
-        if round(analysis.discount_pct) > 0
-        else f"Normal RRP: £{analysis.rrp_gbp:.2f}"
-    )
-    disc_badge = format_discount_badge(analysis.discount_pct, analysis.savings_gbp)
-
-    headline = (
-        f"## 🏷️ Deal Price: £{analysis.total_gbp:.2f}\n"
-        f"### {rrp_part}  •  {disc_badge}\n"
-        f"📍 Best in-stock UK price at **{retailer.display_name}**"
-    )
-
-    embed = discord.Embed(
-        title=f"{title_prefix}{atl_badge}{title}",
-        url=link_url or None,
-        description=headline,
-        color=color,
-    )
-
-    if item.category:
-        embed.add_field(name="📂 Category", value=f"**{item.category}**", inline=False)
-
-    embed.add_field(
-        name="💷 Price Breakdown",
-        value=(
-            f"• **Item Price:** £{analysis.item_price_gbp:.2f}\n"
-            f"• **UK Delivery:** £{analysis.shipping_gbp:.2f} *({shipping_note})*\n"
-            f"• **Total Landed:** **£{analysis.total_gbp:.2f}**\n"
-            f"• **Normal RRP:** £{analysis.rrp_gbp:.2f}"
-        ),
-        inline=True,
-    )
-
-    history_lines = []
-    if is_all_time_low:
-        history_lines.append("🔥 **Lowest price ever tracked!**")
-    if analysis.historical_low_gbp is not None:
-        history_lines.append(f"• **Tracked Low:** £{analysis.historical_low_gbp:.2f}")
-    if analysis.historical_avg_gbp is not None:
-        history_lines.append(f"• **Tracked Avg:** £{analysis.historical_avg_gbp:.2f}")
-    history_lines.append(f"• **Retiring Soon:** {'⚠️ Yes' if item.is_retiring else 'No'}")
-
-    embed.add_field(
-        name="📊 Price Context",
-        value="\n".join(history_lines),
-        inline=True,
-    )
-
-    embed.add_field(
-        name=f"{verdict_icon} Verdict: {analysis.verdict}",
-        value=analysis.forecast,
-        inline=False,
-    )
-
-    if link_url:
-        embed.add_field(
-            name="🛒 Where to Buy",
-            value=f"**[Open {retailer.display_name} Deal Page →]({link_url})**",
-            inline=False,
-        )
-
-    box_art = item.image_url or default_box_art_url(item.set_number)
-    if box_art:
-        embed.set_image(url=box_art)
-
-    embed.set_footer(text=f"Set #{item.set_number or item.id} • UK GBP (£) inc. delivery")
-
-    embeds = [embed]
-    if has_chart:
-        chart_embed = discord.Embed(
-            title="📈 Tracked Price History (GBP)",
-            color=color,
-        )
-        chart_embed.set_image(url="attachment://chart.png")
-        embeds.append(chart_embed)
-
-    return embeds
-
-
-class _PingUserSelect(discord.ui.UserSelect):
-    def __init__(self) -> None:
-        super().__init__(
-            placeholder="1. Pick a user to manage their pings...",
-            min_values=1,
-            max_values=1,
-            row=0,
-        )
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        view = self.view
-        assert isinstance(view, PingManagerView)
-        view.target_user = self.values[0]
-        view.rebuild_items()
-        await interaction.response.edit_message(embed=view.build_embed(), view=view)
-
-
-class _PingSetSelect(discord.ui.Select):
-    def __init__(
-        self,
-        options: list[discord.SelectOption],
-        chunk_keys: set[str],
-        *,
-        placeholder: str,
-        row: int,
-    ) -> None:
-        self.chunk_keys = chunk_keys
-        super().__init__(
-            placeholder=placeholder,
-            min_values=0,
-            max_values=len(options),
-            options=options,
-            row=row,
-        )
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        view = self.view
-        assert isinstance(view, PingManagerView)
-        if not view.target_user:
-            await interaction.response.send_message(
-                embed=make_error_embed("Pick a User", "Please pick a user first."),
-                ephemeral=True,
-            )
-            return
-        selected_keys = set(self.values)
-        uid = str(view.target_user.id)
-        for item in view.bot.db.list_items():
-            key = item.set_number or str(item.id)
-            if key not in self.chunk_keys:
-                continue
-            current = (
-                list(item.notify_user_ids)
-                if item.notify_user_ids
-                else list(dict.fromkeys([str(view.bot.config.user_id), *view.bot.config.extra_notify_user_ids]))
-            )
-            want = key in selected_keys
-            changed = False
-            if want and uid not in current:
-                current.append(uid)
-                changed = True
-            elif not want and uid in current:
-                current.remove(uid)
-                changed = True
-            elif not item.notify_user_ids:
-                changed = True
-
-            if changed:
-                updated = view.bot.db.update_item(item.id, notify_user_ids=current)
-                if updated and updated.set_number:
-                    upsert_wishlist_entry(
-                        view.bot.config.wishlist_path,
-                        {
-                            "name": updated.name,
-                            "set_number": updated.set_number,
-                            "notify_user_ids": list(updated.notify_user_ids),
-                        },
-                    )
-        view.rebuild_items()
-        await interaction.response.edit_message(embed=view.build_embed(), view=view)
-
-
-class PingManagerView(discord.ui.View):
-    def __init__(self, bot: "LegoTrackerBot", target_user: discord.abc.User | None = None) -> None:
-        super().__init__(timeout=180)
-        self.bot = bot
-        self.target_user = target_user
-        self.rebuild_items()
-
-    def rebuild_items(self) -> None:
-        self.clear_items()
-        self.add_item(_PingUserSelect())
-
-        items = self.bot.db.list_items()
-        if self.target_user and items:
-            uid = str(self.target_user.id)
-            chunks = [items[i : i + 25] for i in range(0, min(len(items), 75), 25)]
-            for idx, chunk in enumerate(chunks):
-                options: list[discord.SelectOption] = []
-                chunk_keys: set[str] = set()
-                for item in chunk:
-                    key = item.set_number or str(item.id)
-                    chunk_keys.add(key)
-                    current = (
-                        list(item.notify_user_ids)
-                        if item.notify_user_ids
-                        else list(dict.fromkeys([str(self.bot.config.user_id), *self.bot.config.extra_notify_user_ids]))
-                    )
-                    label = format_item_title(item)[:100]
-                    desc = (item.category or "LEGO Set")[:100]
-                    options.append(
-                        discord.SelectOption(
-                            label=label,
-                            value=key,
-                            description=desc,
-                            default=(uid in current),
-                        )
-                    )
-                start_n = idx * 25 + 1
-                end_n = idx * 25 + len(chunk)
-                placeholder = (
-                    "2. Check/uncheck sets for this user..."
-                    if len(chunks) == 1
-                    else f"2. Check/uncheck sets ({start_n}–{end_n})..."
-                )
-                self.add_item(_PingSetSelect(options, chunk_keys, placeholder=placeholder, row=1 + idx))
-
-            btn_row = 1 + len(chunks)
-            add_all_btn = discord.ui.Button(
-                label="Add to ALL",
-                emoji="✅",
-                style=discord.ButtonStyle.success,
-                row=btn_row,
-            )
-            remove_all_btn = discord.ui.Button(
-                label="Remove from ALL",
-                emoji="🔕",
-                style=discord.ButtonStyle.danger,
-                row=btn_row,
-            )
-
-            async def _on_add_all(interaction: discord.Interaction) -> None:
-                await self._bulk_set(interaction, add=True)
-
-            async def _on_remove_all(interaction: discord.Interaction) -> None:
-                await self._bulk_set(interaction, add=False)
-
-            add_all_btn.callback = _on_add_all
-            remove_all_btn.callback = _on_remove_all
-            self.add_item(add_all_btn)
-            self.add_item(remove_all_btn)
-
-    async def _bulk_set(self, interaction: discord.Interaction, *, add: bool) -> None:
-        if not self.target_user:
-            return
-        uid = str(self.target_user.id)
-        for item in self.bot.db.list_items():
-            current = (
-                list(item.notify_user_ids)
-                if item.notify_user_ids
-                else list(dict.fromkeys([str(self.bot.config.user_id), *self.bot.config.extra_notify_user_ids]))
-            )
-            if add and uid not in current:
-                current.append(uid)
-            elif not add and uid in current:
-                current.remove(uid)
-            updated = self.bot.db.update_item(item.id, notify_user_ids=current)
-            if updated and updated.set_number:
-                upsert_wishlist_entry(
-                    self.bot.config.wishlist_path,
-                    {
-                        "name": updated.name,
-                        "set_number": updated.set_number,
-                        "notify_user_ids": list(updated.notify_user_ids),
-                    },
-                )
-        self.rebuild_items()
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
-
-    def build_embed(self) -> discord.Embed:
-        items = self.bot.db.list_items()
-        if not items:
-            return make_status_embed("🔔 Manage Pings", "Your wishlist is currently empty.")
-        if not self.target_user:
-            return make_status_embed(
-                "🔔 Interactive Ping Manager",
-                "Pick a Discord user from the dropdown below to check/uncheck which LEGO sets they get pinged for.",
-                color=discord.Color.blue(),
-            )
-        uid = str(self.target_user.id)
-        lines = []
-        for item in items:
-            current = (
-                list(item.notify_user_ids)
-                if item.notify_user_ids
-                else list(dict.fromkeys([str(self.bot.config.user_id), *self.bot.config.extra_notify_user_ids]))
-            )
-            mark = "✅" if uid in current else "⬜"
-            lines.append(f"{mark} **{format_item_title(item)}**")
-        return make_status_embed(
-            "🔔 Interactive Ping Manager",
-            (
-                f"Managing pings for <@{uid}>\n"
-                f"Use the dropdown below to check/uncheck sets, or click **Add to ALL** / **Remove from ALL**:\n\n"
-                + "\n".join(lines)
-            ),
-            color=discord.Color.blue(),
-            footer="Changes save immediately • Menu stays active for 3 minutes",
-        )
-
-
-class CheckResultView(discord.ui.View):
-    """Interactive buttons attached to live price-check embeds."""
-
-    def __init__(self, bot: "LegoTrackerBot", set_number: str | None) -> None:
-        super().__init__(timeout=600)
-        self.bot = bot
-        self.set_number = set_number
-        if not set_number:
-            self.recheck_btn.disabled = True
-
-    @discord.ui.button(label="Re-check", emoji="🔄", style=discord.ButtonStyle.secondary)
-    async def recheck_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not self.set_number:
-            await interaction.response.send_message("Set number unavailable.", ephemeral=True)
-            return
-        await interaction.response.defer()
-        embeds = await self.bot.run_price_checks(set_number=self.set_number, force_refresh=True)
-        if embeds:
-            await interaction.edit_original_response(embed=embeds[0], view=self)
-
-    @discord.ui.button(label="Manage Pings", emoji="🔔", style=discord.ButtonStyle.primary)
-    async def pings_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        view = PingManagerView(self.bot, target_user=interaction.user)
-        await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
-
-
-class EditSetModal(discord.ui.Modal):
-    """Modal popup to edit a set's alert settings."""
-
-    def __init__(self, bot: "LegoTrackerBot", item: TrackedItem, detail_view: "SetDetailView | None" = None) -> None:
-        super().__init__(title=f"Edit #{item.set_number or item.id}")
-        self.bot = bot
-        self.item = item
-        self.detail_view = detail_view
-
-        self.target_input = discord.ui.TextInput(
-            label="Target Price (£, 0 or blank to clear)",
-            placeholder="e.g. 320.00",
-            default=f"{item.target_price_gbp:.2f}" if item.target_price_gbp else "",
-            required=False,
-            max_length=12,
-        )
-        self.discount_input = discord.ui.TextInput(
-            label="Minimum Discount (% off RRP)",
-            placeholder="e.g. 15",
-            default=f"{item.min_discount_pct:.0f}",
-            required=True,
-            max_length=5,
-        )
-        self.add_item(self.target_input)
-        self.add_item(self.discount_input)
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        raw_target = self.target_input.value.strip()
-        raw_disc = self.discount_input.value.strip()
-        try:
-            target_val: float | None = float(raw_target) if raw_target else 0.0
-            if target_val is not None and (target_val < 0 or target_val > 5000):
-                raise ValueError("Target price must be between £0 and £5000.")
-            disc_val = float(raw_disc)
-            if disc_val < 0 or disc_val > 90:
-                raise ValueError("Minimum discount must be between 0% and 90%.")
-        except ValueError as exc:
-            await interaction.response.send_message(
-                embed=make_error_embed("Invalid Input", str(exc)),
-                ephemeral=True,
-            )
-            return
-
-        updated = self.bot.db.update_item(
-            self.item.id,
-            target_price_gbp=target_val,
-            min_discount_pct=disc_val,
-        )
-        if not updated:
-            await interaction.response.send_message(
-                embed=make_error_embed("Not Found", "This set is no longer on the wishlist."),
-                ephemeral=True,
-            )
-            return
-        if updated.set_number:
-            upsert_wishlist_entry(
-                self.bot.config.wishlist_path,
-                {
-                    "name": updated.name,
-                    "set_number": updated.set_number,
-                    "target_price_gbp": updated.target_price_gbp,
-                    "min_discount_pct": updated.min_discount_pct,
-                },
-            )
-        if self.detail_view is not None:
-            self.detail_view.item = updated
-            await interaction.response.edit_message(embed=self.detail_view.build_embed(), view=self.detail_view)
-        else:
-            await interaction.response.send_message(
-                embed=make_status_embed(
-                    f"✏️ Updated: {format_item_title(updated)}",
-                    (
-                        f"• **Target Price:** {f'£{updated.target_price_gbp:.2f}' if updated.target_price_gbp else 'None'}\n"
-                        f"• **Min Discount:** {updated.min_discount_pct:.0f}%"
-                    ),
-                    color=discord.Color.green(),
-                ),
-                ephemeral=True,
-            )
-
-
-class SetDetailView(discord.ui.View):
-    """Detail card and quick actions for a single tracked set."""
-
-    def __init__(self, bot: "LegoTrackerBot", item: TrackedItem) -> None:
-        super().__init__(timeout=300)
-        self.bot = bot
-        self.item = item
-
-    def build_embed(self) -> discord.Embed:
-        item = self.item
-        latest = self.bot.db.get_latest_price(item.id)
-        last_dt = self.bot.db.get_last_checked_at(item.id)
-        rrp_str = f"£{item.rrp_gbp:.2f}" if item.rrp_gbp > 0 else "Auto-detect"
-        target_str = f"£{item.target_price_gbp:.2f}" if item.target_price_gbp else "None"
-
-        if latest:
-            if item.rrp_gbp > 0:
-                disc_pct = ((item.rrp_gbp - latest.total_gbp) / item.rrp_gbp) * 100
-                disc_part = f" ({format_discount_short(disc_pct)})"
-            else:
-                disc_part = ""
-            price_line = f"🏷️ **Latest:** £{latest.total_gbp:.2f}{disc_part} at {latest.retailer}"
-        else:
-            price_line = "🏷️ **Latest:** *Not checked yet*"
-
-        checked_line = (
-            f"🕒 **Last Checked:** <t:{int(last_dt.timestamp())}:R>"
-            if last_dt is not None
-            else "🕒 **Last Checked:** *Never*"
-        )
-        cat_line = f"📂 **Category:** {item.category}\n" if item.category else ""
-        retire_line = "⚠️ **Retiring Soon:** Yes\n" if item.is_retiring else ""
-        pings = format_pings(self.bot.config.user_id, item, extra_user_ids=self.bot.config.extra_notify_user_ids)
-
-        embed = discord.Embed(
-            title=f"🧩 {format_item_title(item)}",
-            description=(
-                f"{cat_line}"
-                f"💷 **Normal RRP:** {rrp_str}\n"
-                f"{price_line}\n"
-                f"🎯 **Alert:** ≥{item.min_discount_pct:.0f}% off | Target {target_str}\n"
-                f"{retire_line}"
-                f"{checked_line}\n"
-                f"🔔 **Notify:** {pings}"
-            ),
-            color=discord.Color.blue(),
-        )
-        box_art = item.image_url or default_box_art_url(item.set_number)
-        if box_art:
-            embed.set_thumbnail(url=box_art)
-        embed.set_footer(text=f"Set #{item.set_number or item.id}")
-        return embed
-
-    @discord.ui.button(label="Re-check", emoji="🔄", style=discord.ButtonStyle.primary)
-    async def recheck_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not self.item.set_number:
-            await interaction.response.send_message("Set number unavailable.", ephemeral=True)
-            return
-        await interaction.response.defer(ephemeral=True)
-        embeds = await self.bot.run_price_checks(set_number=self.item.set_number, force_refresh=True)
-        if embeds:
-            await interaction.followup.send(embed=embeds[0], ephemeral=True)
-
-    @discord.ui.button(label="Edit", emoji="✏️", style=discord.ButtonStyle.secondary)
-    async def edit_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.send_modal(EditSetModal(self.bot, self.item, detail_view=self))
-
-    @discord.ui.button(label="History", emoji="📈", style=discord.ButtonStyle.secondary)
-    async def history_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        embed, file = self.bot._build_history_embed(self.item)
-        if file is not None:
-            await interaction.response.send_message(embed=embed, file=file, ephemeral=True)
-        else:
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    @discord.ui.button(label="Pings", emoji="🔔", style=discord.ButtonStyle.secondary)
-    async def pings_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        view = PingManagerView(self.bot, target_user=interaction.user)
-        await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
-
-    @discord.ui.button(label="Remove", emoji="🗑️", style=discord.ButtonStyle.danger)
-    async def remove_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        self.bot.db.remove_item(self.item.id)
-        if self.item.set_number:
-            remove_wishlist_entry(self.bot.config.wishlist_path, self.item.set_number)
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.disabled = True
-        await interaction.response.edit_message(
-            embed=make_status_embed(
-                "🗑️ Removed from Wishlist",
-                f"Removed **{format_item_title(self.item)}**.",
-                color=discord.Color.orange(),
-            ),
-            view=self,
-        )
-
-
-class _WishlistSelect(discord.ui.Select):
-    def __init__(self, items: list[TrackedItem]) -> None:
-        options = [
-            discord.SelectOption(
-                label=format_item_title(item)[:100],
-                value=str(item.id),
-                description=(item.category or f"Set #{item.set_number or item.id}")[:100],
-            )
-            for item in items[:25]
-        ]
-        super().__init__(placeholder="Inspect or edit a set...", min_values=1, max_values=1, options=options, row=0)
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        view = self.view
-        assert isinstance(view, WishlistView)
-        item_id = int(self.values[0])
-        found = next((it for it in view.bot.db.list_items() if it.id == item_id), None)
-        if not found:
-            await interaction.response.send_message(
-                embed=make_error_embed("Not Found", "That set is no longer on the wishlist."),
-                ephemeral=True,
-            )
-            return
-        detail = SetDetailView(view.bot, found)
-        await interaction.response.send_message(embed=detail.build_embed(), view=detail, ephemeral=True)
-
-
-class WishlistView(discord.ui.View):
-    """Compact, paginated wishlist display with quick set inspector."""
-
-    PAGE_SIZE = 10
-
-    def __init__(self, bot: "LegoTrackerBot", page: int = 0) -> None:
-        super().__init__(timeout=300)
-        self.bot = bot
-        self.page = page
-        self._rebuild()
-
-    def _get_pages(self) -> tuple[list[TrackedItem], int, int]:
-        items = self.bot.db.list_items()
-        total_pages = max(1, (len(items) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
-        self.page = max(0, min(self.page, total_pages - 1))
-        start = self.page * self.PAGE_SIZE
-        return items[start : start + self.PAGE_SIZE], len(items), total_pages
-
-    def _rebuild(self) -> None:
-        self.clear_items()
-        page_items, _, total_pages = self._get_pages()
-        if page_items:
-            self.add_item(_WishlistSelect(page_items))
-        if total_pages > 1:
-            prev_btn = discord.ui.Button(label="◀ Prev", style=discord.ButtonStyle.secondary, disabled=(self.page == 0), row=1)
-            next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary, disabled=(self.page >= total_pages - 1), row=1)
-
-            async def _on_prev(interaction: discord.Interaction) -> None:
-                self.page -= 1
-                self._rebuild()
-                await interaction.response.edit_message(embed=self.build_embed(), view=self)
-
-            async def _on_next(interaction: discord.Interaction) -> None:
-                self.page += 1
-                self._rebuild()
-                await interaction.response.edit_message(embed=self.build_embed(), view=self)
-
-            prev_btn.callback = _on_prev
-            next_btn.callback = _on_next
-            self.add_item(prev_btn)
-            self.add_item(next_btn)
-
-    def build_embed(self) -> discord.Embed:
-        page_items, total_count, total_pages = self._get_pages()
-        if not total_count:
-            return make_status_embed(
-                "🧩 Your LEGO Wishlist",
-                "Your wishlist is empty. Use `/add <set_number>` to add a set!",
-                color=discord.Color.blue(),
-            )
-        lines: list[str] = []
-        for item in page_items:
-            latest = self.bot.db.get_latest_price(item.id)
-            last_dt = self.bot.db.get_last_checked_at(item.id)
-            title = format_item_title(item)
-            retire_tag = " ⚠️" if item.is_retiring else ""
-            checked_part = f" · <t:{int(last_dt.timestamp())}:R>" if last_dt else ""
-            if latest:
-                if item.rrp_gbp > 0:
-                    disc_pct = ((item.rrp_gbp - latest.total_gbp) / item.rrp_gbp) * 100
-                    disc_str = f" `{format_discount_short(disc_pct)}`"
-                else:
-                    disc_pct = 0.0
-                    disc_str = ""
-                hit_target = item.target_price_gbp is not None and latest.total_gbp <= item.target_price_gbp
-                hit_disc = disc_pct >= item.min_discount_pct
-                dot = "🟢" if (hit_target or hit_disc) else ("🟡" if disc_pct > 0 else "⚪")
-                target_tag = " 🎯" if hit_target else ""
-                lines.append(f"{dot} **{title}** — **£{latest.total_gbp:.2f}**{disc_str}{target_tag}{retire_tag}{checked_part}")
-            else:
-                rrp_str = f"RRP £{item.rrp_gbp:.2f}" if item.rrp_gbp > 0 else "RRP auto"
-                lines.append(f"⚪ **{title}** — *Not checked* · {rrp_str}{retire_tag}")
-
-        page_tag = f" (Page {self.page + 1}/{total_pages})" if total_pages > 1 else ""
-        return make_status_embed(
-            f"🧩 Your LEGO Wishlist ({total_count} sets){page_tag}",
-            "\n".join(lines),
-            color=discord.Color.blue(),
-            footer="Pick a set below to view details, edit targets, or re-check",
-        )
-
-
-
-class RetiredSetView(discord.ui.View):
-    """Undo button attached to retired-set auto-removal notifications."""
-
-    def __init__(self, bot: "LegoTrackerBot", item: TrackedItem) -> None:
-        super().__init__(timeout=86400)
-        self.bot = bot
-        self.item = item
-
-    @discord.ui.button(label="Re-add Set", emoji="↩️", style=discord.ButtonStyle.secondary)
-    async def readd_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if self.item.set_number and self.bot.db.get_item_by_set_number(self.item.set_number) is None:
-            self.bot.db.add_item(
-                name=self.item.name,
-                rrp_gbp=self.item.rrp_gbp,
-                set_number=self.item.set_number,
-                category=self.item.category,
-                target_price_gbp=self.item.target_price_gbp,
-                min_discount_pct=self.item.min_discount_pct,
-                url=self.item.url,
-                retailer=self.item.retailer,
-                is_retiring=self.item.is_retiring,
-                image_url=self.item.image_url,
-                notify_user_ids=self.item.notify_user_ids,
-            )
-            upsert_wishlist_entry(
-                self.bot.config.wishlist_path,
-                {
-                    "name": self.item.name,
-                    "set_number": self.item.set_number,
-                    "category": self.item.category,
-                    "rrp_gbp": self.item.rrp_gbp if self.item.rrp_gbp > 0 else None,
-                    "target_price_gbp": self.item.target_price_gbp,
-                    "min_discount_pct": self.item.min_discount_pct,
-                    "is_retiring": self.item.is_retiring,
-                    "image_url": self.item.image_url,
-                    "notify_user_ids": list(self.item.notify_user_ids),
-                },
-            )
-        button.disabled = True
-        button.label = "Re-added"
-        await interaction.response.edit_message(view=self)
 
 
 def is_admin_user(interaction: discord.Interaction, owner_user_id: int) -> bool:
@@ -881,26 +180,8 @@ class LegoTrackerBot(discord.Client):
         except Exception as exc:
             logger.warning("Could not save store cooldowns: %s", exc)
 
-    def _format_store_health_line(self) -> str:
-        cooldowns = get_source_health()
-        if not cooldowns:
-            return "🛒 **Store Health:** ✅ All UK stores healthy"
-        parts = []
-        for src, secs in sorted(cooldowns.items()):
-            mins = max(1, secs // 60)
-            parts.append(f"`{src}` ({mins}m)")
-        return f"🛒 **Store Health:** ⚠️ Cooldown: {', '.join(parts)}"
-
     def _format_status_text(self, text: str) -> str:
-        now_ts = int(time.time())
-        next_ts = now_ts + self.config.check_interval_minutes * 60
-        health_line = self._format_store_health_line()
-        return (
-            f"📌 **Scheduled Check Status**\n"
-            f"{text}\n"
-            f"{health_line}\n"
-            f"🕒 Updated <t:{now_ts}:R> • Next check ~<t:{next_ts}:R>"
-        )
+        return format_pinned_dashboard(self.db, self.config, text)
 
     async def _get_status_message(self, channel: discord.abc.Messageable) -> Optional[discord.Message]:
         """Return the single pinned status message, creating (and pinning) it if it doesn't exist yet."""
@@ -911,7 +192,7 @@ class LegoTrackerBot(discord.Client):
             try:
                 return await channel.fetch_message(int(msg_id))
             except Exception:
-                pass  # Deleted or inaccessible — create a fresh one below
+                pass
         try:
             msg = await channel.send(
                 content=self._format_status_text("⏳ Waiting for the first scheduled check..."),
@@ -923,7 +204,6 @@ class LegoTrackerBot(discord.Client):
         try:
             await msg.pin(reason="LEGO bot scheduled check status")
         except Exception as exc:
-            # Needs the 'Manage Messages' permission; the message still gets edited in place without it
             logger.info("Could not pin status message (grant 'Manage Messages' to enable): %s", exc)
         self.db.set_state_json("status_message", {"message_id": msg.id, "channel_id": channel_id})
         return msg
@@ -991,21 +271,8 @@ class LegoTrackerBot(discord.Client):
         if not self.db.should_send_weekly_summary() or not isinstance(channel, discord.abc.Messageable):
             return
         self.db.prune_old_history(retention_days=180)
-        lines = []
-        for item in self.db.list_items():
-            hist = self.db.get_price_history(item.id, limit=1)
-            low = self.db.get_historical_low(item.id)
-            t = format_item_title(item)
-            if hist:
-                low_str = f" | Low £{low:.2f}" if low is not None else ""
-                lines.append(f"• **{t}**: **£{hist[0].total_gbp:.2f}**{low_str}")
-            else:
-                lines.append(f"• **{t}**: *No price recorded yet*")
-        summary_embed = make_status_embed(
-            "📊 Weekly UK LEGO Wishlist Summary",
-            "\n".join(lines) if lines else "Your wishlist is empty.",
-            color=discord.Color.blue(),
-        )
+        items = self.db.list_items()
+        summary_embed = build_weekly_summary_embed(self.db, items)
         if self.dev_mode:
             summary_content = "🛠️ [DEV MODE] Weekly LEGO summary! *(pings suppressed)*"
             allowed = discord.AllowedMentions.none()
@@ -1018,6 +285,230 @@ class LegoTrackerBot(discord.Client):
             allowed = discord.AllowedMentions.all()
         await channel.send(content=summary_content, embed=summary_embed, allowed_mentions=allowed)
         self.db.mark_weekly_summary_sent()
+
+    async def _refresh_item_metadata(
+        self,
+        item: TrackedItem,
+        channel: object,
+        now_mono: float,
+    ) -> tuple[TrackedItem | None, bool]:
+        """Refresh Brickset metadata when due; archive retired sets instead of deleting."""
+        rrp = item.rrp_gbp
+        is_retiring = item.is_retiring
+        image_url = item.image_url
+        resolved_name = clean_set_display_name(item.name, item.set_number) or item.name
+        category = item.category
+
+        meta_ttl = 86400.0 if is_retiring else 604800.0
+        meta_refresh_due = now_mono - self._last_retiring_meta_check.get(item.id, 0.0) >= meta_ttl
+        needs_meta = (
+            rrp <= 0
+            or not image_url
+            or not category
+            or not resolved_name
+            or resolved_name.startswith("LEGO Set #")
+            or meta_refresh_due
+        )
+        if not (needs_meta and item.set_number):
+            return item, False
+
+        meta = await lookup_set_metadata(
+            self.http_session,  # type: ignore[arg-type]
+            item.set_number,
+            brickset_api_key=self.config.brickset_api_key,
+            proxy_url=self.config.proxy_url,
+        )
+        self._last_retiring_meta_check[item.id] = now_mono
+        if meta.is_retired:
+            title = format_item_title(item)
+            box_art = item.image_url or default_box_art_url(item.set_number)
+            self.db.archive_item(item.id)
+            if item.set_number:
+                remove_wishlist_entry(self.config.wishlist_path, item.set_number)
+            retired_embed = make_status_embed(
+                f"📦 Archived Retired Set: {title}",
+                "This LEGO set has now **retired** and was archived from active checks *(price history preserved)*.",
+                color=discord.Color.dark_grey(),
+                thumbnail_url=box_art,
+            )
+            if isinstance(channel, discord.abc.Messageable):
+                if self.dev_mode:
+                    retired_content = f"🛠️ [DEV MODE] **{title}** has retired and was archived. *(pings suppressed)*"
+                    allowed = discord.AllowedMentions.none()
+                else:
+                    pings = format_pings(
+                        self.config.user_id,
+                        item,
+                        extra_user_ids=self.config.extra_notify_user_ids,
+                    )
+                    retired_content = f"{pings} **{title}** has **retired** and was archived."
+                    allowed = discord.AllowedMentions.all()
+                await channel.send(
+                    content=retired_content,
+                    embed=retired_embed,
+                    view=RetiredSetView(self, item),
+                    allowed_mentions=allowed,
+                )
+            return None, True
+
+        new_rrp = meta.rrp_gbp if (meta.rrp_gbp and meta.rrp_gbp > 0) else rrp
+        new_name = meta.name or resolved_name
+        new_img = meta.image_url or image_url or default_box_art_url(item.set_number)
+        new_cat = meta.category or category
+        new_retiring = meta.is_retiring or is_retiring
+        if (
+            new_rrp != item.rrp_gbp
+            or new_name != item.name
+            or new_img != item.image_url
+            or new_cat != item.category
+            or new_retiring != item.is_retiring
+        ):
+            updated = self.db.update_item(
+                item.id,
+                name=new_name,
+                rrp_gbp=new_rrp,
+                category=new_cat,
+                is_retiring=new_retiring,
+                image_url=new_img,
+            )
+            if updated:
+                item = updated
+                upsert_wishlist_entry(
+                    self.config.wishlist_path,
+                    {
+                        "name": updated.name,
+                        "set_number": item.set_number,
+                        "category": new_cat,
+                        "rrp_gbp": new_rrp if new_rrp > 0 else None,
+                        "is_retiring": new_retiring,
+                        "image_url": new_img,
+                    },
+                )
+        return item, False
+
+    async def _fetch_offer(
+        self,
+        item: TrackedItem,
+        *,
+        scheduled: bool,
+        force_refresh: bool,
+        interactive_serp_budget: list[int],
+    ) -> tuple[UKOffer | None, list[str]]:
+        resolved_name = clean_set_display_name(item.name, item.set_number) or item.name
+        can_use_serp = bool(self.config.serpapi_key) and (
+            self.db.can_spend_token("serpapi", self.config.serpapi_monthly_limit, manual_force=force_refresh)[0]
+            if scheduled or force_refresh
+            else (interactive_serp_budget[0] > 0 and self.db.can_spend_token("serpapi", self.config.serpapi_monthly_limit, manual_force=False)[0])
+        )
+
+        def _on_serp_spent() -> None:
+            self.db.record_token_spend("serpapi")
+            if not scheduled and not force_refresh and interactive_serp_budget[0] > 0:
+                interactive_serp_budget[0] -= 1
+
+        return await find_best_uk_offer(
+            self.http_session,  # type: ignore[arg-type]
+            name=resolved_name,
+            set_number=item.set_number,
+            direct_url=item.url,
+            rrp_gbp=item.rrp_gbp if item.rrp_gbp > 0 else None,
+            has_amazon_prime=self.config.has_amazon_prime,
+            prefer_click_and_collect=self.config.prefer_click_and_collect,
+            serpapi_key=self.config.serpapi_key,
+            allow_serpapi=can_use_serp,
+            on_serpapi_credit_used=_on_serp_spent,
+            on_amazon_dp_url_update=self.db.set_amazon_dp_url,
+            proxy_url=self.config.proxy_url,
+            force_refresh=force_refresh,
+        )
+
+    def _matching_ping_users(self, item: TrackedItem, analysis: PriceAnalysis) -> list[str]:
+        """Return user IDs whose personal or global threshold is met by this offer."""
+        base_users = effective_notify_user_ids(item, self.config.user_id, self.config.extra_notify_user_ids)
+        custom = self.db.get_user_thresholds(item.id)
+        matched: list[str] = []
+        for uid in base_users:
+            t_gbp, m_pct = custom.get(uid, (item.target_price_gbp, item.min_discount_pct))
+            eff_target = t_gbp if t_gbp is not None else item.target_price_gbp
+            eff_disc = m_pct if m_pct is not None else item.min_discount_pct
+            hit_target = eff_target is not None and analysis.total_gbp <= eff_target
+            hit_disc = analysis.discount_pct >= eff_disc
+            if hit_target or hit_disc:
+                matched.append(uid)
+        return matched
+
+    async def _notify_if_deal(
+        self,
+        item: TrackedItem,
+        analysis: PriceAnalysis,
+        best_offer: UKOffer,
+        *,
+        is_all_time_low: bool,
+        channel: object,
+        update_status: Callable[[str], Awaitable[None]],
+    ) -> None:
+        title = format_item_title(item)
+        matched_users = self._matching_ping_users(item, analysis)
+        if not matched_users:
+            if item.last_alert_price_gbp is not None:
+                self.db.reset_alert_state(item.id)
+            await update_status(
+                f"ℹ️ **{title}** had no good deals "
+                f"*(best: £{analysis.total_gbp:.2f} at {best_offer.retailer.display_name}, {format_discount_short(analysis.discount_pct)})*."
+            )
+            return
+
+        if not self.db.should_alert(item, analysis.total_gbp, self.config.alert_cooldown_hours):
+            await update_status(
+                f"ℹ️ **{title}** is still on deal (**£{analysis.total_gbp:.2f}** at "
+                f"{best_offer.retailer.display_name} — alert cooldown active)."
+            )
+            return
+
+        if (
+            is_quiet_hours(self.config.quiet_hours_start, self.config.quiet_hours_end)
+            and not is_all_time_low
+            and not item.is_retiring
+        ):
+            await update_status(
+                f"🌙 **{title}** is on deal (**£{analysis.total_gbp:.2f}**) — holding ping until morning quiet hours end."
+            )
+            return
+
+        await update_status(f"🔥 Good deal spotted for **{title}**!")
+        series = list(reversed([h.total_gbp for h in self.db.get_price_history(item.id, limit=30)]))
+        rrp = item.rrp_gbp if item.rrp_gbp > 0 else analysis.rrp_gbp
+        chart_bytes = generate_price_chart(series, rrp) if len(series) >= 2 else None
+        embeds = build_alert_embeds(
+            item,
+            analysis,
+            best_offer.retailer,
+            best_offer.shipping_note,
+            offer_url=best_offer.url,
+            is_all_time_low=is_all_time_low,
+            has_chart=chart_bytes is not None,
+        )
+        if isinstance(channel, discord.abc.Messageable):
+            deal_summary = (
+                f"🔥 **{title}** — **£{analysis.total_gbp:.2f}** "
+                f"at {best_offer.retailer.display_name} ({format_discount_short(analysis.discount_pct)})"
+            )
+            if self.dev_mode:
+                alert_content = f"🛠️ [DEV MODE] {deal_summary} *(pings suppressed)*"
+                allowed = discord.AllowedMentions.none()
+            else:
+                pings = " ".join(f"<@{uid}>" for uid in matched_users)
+                alert_content = f"{pings} {deal_summary}"
+                allowed = discord.AllowedMentions.all()
+            view = DealLinkView(best_offer.url, best_offer.retailer.display_name)
+            if chart_bytes:
+                file = discord.File(io.BytesIO(chart_bytes), filename="chart.png")
+                await channel.send(
+                    content=alert_content, embeds=embeds, file=file, view=view, allowed_mentions=allowed
+                )
+            else:
+                await channel.send(content=alert_content, embeds=embeds, view=view, allowed_mentions=allowed)
+            self.db.mark_alerted(item.id, analysis.total_gbp)
 
     async def run_price_checks(
         self,
@@ -1035,7 +526,7 @@ class LegoTrackerBot(discord.Client):
             all_items = self.db.list_items()
             if not all_items:
                 return []
-            items = self.db.get_items_due_for_check(min_age_hours=4.0)[:1]
+            items = self.db.get_items_due_for_check(min_age_hours=self.config.stale_check_hours)[:1]
         else:
             items = self.db.list_items()
 
@@ -1070,11 +561,26 @@ class LegoTrackerBot(discord.Client):
         sem = asyncio.Semaphore(1 if scheduled else 3)
         interactive_serp_budget = [5 if set_number is None else 1]
 
-        async def _emit(embed: discord.Embed, item_set_number: str | None = None) -> None:
+        async def _emit(
+            embed: discord.Embed,
+            item_set_number: str | None = None,
+            *,
+            deal_url: str | None = None,
+            retailer_name: str | None = None,
+        ) -> None:
             async with emit_lock:
                 result_embeds.append(embed)
                 if on_item_embed is not None:
-                    view = CheckResultView(self, item_set_number) if item_set_number else None
+                    view = (
+                        CheckResultView(
+                            self,
+                            item_set_number,
+                            deal_url=deal_url,
+                            retailer_name=retailer_name,
+                        )
+                        if item_set_number
+                        else None
+                    )
                     await on_item_embed(embed, view)
 
         async def _check_one(idx: int, item: TrackedItem) -> None:
@@ -1083,7 +589,6 @@ class LegoTrackerBot(discord.Client):
                     await asyncio.sleep(random.uniform(1.5, 3.0))
 
                 status_msg: Optional[discord.Message] = None
-                item_title = format_item_title(item)
                 if scheduled and isinstance(channel, discord.abc.Messageable):
                     status_msg = await self._get_status_message(channel)
 
@@ -1097,151 +602,29 @@ class LegoTrackerBot(discord.Client):
                         except Exception:
                             pass
 
-                await _update_status(f"🔍 Checking **{item_title}** for UK deals...")
+                await _update_status(f"🔍 Checking **{format_item_title(item)}** for UK deals...")
 
-                rrp = item.rrp_gbp
-                is_retiring = item.is_retiring
-                image_url = item.image_url
-                resolved_name = clean_set_display_name(item.name, item.set_number) or item.name
-                category = item.category
+                refreshed, was_retired = await self._refresh_item_metadata(item, channel, now_mono)
+                if was_retired or refreshed is None:
+                    return
+                item = refreshed
 
-                meta_ttl = 86400.0 if is_retiring else 604800.0
-                meta_refresh_due = (
-                    now_mono - self._last_retiring_meta_check.get(item.id, 0.0) >= meta_ttl
-                )
-                needs_meta = (
-                    rrp <= 0
-                    or not image_url
-                    or not category
-                    or not resolved_name
-                    or resolved_name.startswith("LEGO Set #")
-                    or meta_refresh_due
-                )
-                if needs_meta and item.set_number:
-                    meta = await lookup_set_metadata(
-                        self.http_session,  # type: ignore[arg-type]
-                        item.set_number,
-                        brickset_api_key=self.config.brickset_api_key,
-                        proxy_url=self.config.proxy_url,
-                    )
-                    self._last_retiring_meta_check[item.id] = now_mono
-                    if meta.is_retired:
-                        title = format_item_title(item)
-                        box_art = item.image_url or default_box_art_url(item.set_number)
-                        self.db.remove_item(item.id)
-                        if item.set_number:
-                            remove_wishlist_entry(self.config.wishlist_path, item.set_number)
-                        retired_embed = make_status_embed(
-                            f"📦 Removed Retired Set: {title}",
-                            "This LEGO set has now **retired** and was automatically removed from your wishlist.",
-                            color=discord.Color.dark_grey(),
-                            image_url=box_art,
-                        )
-                        if isinstance(channel, discord.abc.Messageable):
-                            if self.dev_mode:
-                                retired_content = f"🛠️ [DEV MODE] **{title}** has been removed from your wishlist because it has retired. *(pings suppressed)*"
-                                allowed = discord.AllowedMentions.none()
-                            else:
-                                pings = format_pings(
-                                    self.config.user_id,
-                                    item,
-                                    extra_user_ids=self.config.extra_notify_user_ids,
-                                )
-                                retired_content = f"{pings} **{title}** has been removed from your wishlist as it has **retired**."
-                                allowed = discord.AllowedMentions.all()
-                            retired_view = RetiredSetView(self, item)
-                            await channel.send(
-                                content=retired_content,
-                                embed=retired_embed,
-                                view=retired_view,
-                                allowed_mentions=allowed,
-                            )
-                        await _emit(retired_embed)
-                        await _update_status(f"📦 **{title}** has retired and was removed from your wishlist.")
-                        return
-
-                    if meta.name and (resolved_name.startswith("LEGO Set #") or len(meta.name) >= len(resolved_name) - 4):
-                        resolved_name = clean_set_display_name(meta.name, item.set_number) or meta.name
-                    if not category and meta.category:
-                        category = meta.category
-                    if rrp <= 0 and meta.rrp_gbp:
-                        rrp = meta.rrp_gbp
-                    if meta.source in ("brickset", "brickset_web", "lego_uk"):
-                        is_retiring = is_retiring or meta.is_retiring
-                    if not image_url and meta.image_url:
-                        image_url = meta.image_url
-
-                    self.db.update_item(
-                        item.id,
-                        name=resolved_name,
-                        category=category,
-                        rrp_gbp=rrp if rrp > 0 else None,
-                        is_retiring=is_retiring,
-                        image_url=image_url,
-                    )
-                    item = self.db.get_item(item.id) or item
-                    if item.set_number:
-                        upsert_wishlist_entry(
-                            self.config.wishlist_path,
-                            {
-                                "name": item.name,
-                                "set_number": item.set_number,
-                                "category": item.category,
-                                "rrp_gbp": item.rrp_gbp if item.rrp_gbp > 0 else None,
-                                "is_retiring": item.is_retiring,
-                                "image_url": item.image_url,
-                            },
-                        )
-
-                allow_serpapi = False
-                if self.config.serpapi_key:
-                    if scheduled:
-                        allow_serpapi, _ = self.db.can_spend_token(
-                            "serpapi", self.config.serpapi_monthly_limit, manual_force=False
-                        )
-                    elif force_refresh and interactive_serp_budget[0] > 0:
-                        allow_serpapi, _ = self.db.can_spend_token(
-                            "serpapi", self.config.serpapi_monthly_limit, manual_force=True
-                        )
-                        if allow_serpapi:
-                            interactive_serp_budget[0] -= 1
-
-                best_offer, notes = await find_best_uk_offer(
-                    self.http_session,  # type: ignore[arg-type]
-                    name=resolved_name,
-                    set_number=item.set_number,
-                    direct_url=item.url,
-                    rrp_gbp=rrp if rrp > 0 else None,
-                    has_amazon_prime=self.config.has_amazon_prime,
-                    prefer_click_and_collect=self.config.prefer_click_and_collect,
-                    serpapi_key=self.config.serpapi_key,
-                    allow_serpapi=allow_serpapi,
-                    on_serpapi_credit_used=lambda: self.db.increment_monthly_usage("serpapi"),
-                    on_amazon_dp_url_update=self.db.set_amazon_dp_url,
-                    proxy_url=self.config.proxy_url,
+                best_offer, notes = await self._fetch_offer(
+                    item,
+                    scheduled=scheduled,
                     force_refresh=force_refresh,
+                    interactive_serp_budget=interactive_serp_budget,
                 )
-
                 self.db.mark_checked(item.id)
 
                 title = format_item_title(item)
                 box_art = item.image_url or default_box_art_url(item.set_number)
-                cat_part = f"📂 **Category:** {item.category}\n" if item.category else ""
-                retiring_line = "⚠️ **Status:** Retiring Soon\n" if is_retiring else ""
-                cat_line = f"{cat_part}{retiring_line}"
                 blocked_notes = [
                     n for n in notes
                     if any(tok in n.lower() for tok in ("rate-limited", "cooldown", "http ", "timeout", "error"))
                 ]
-                set_tag = f"#{item.set_number}" if item.set_number else title
-                excluded_line = (
-                    f"\n\n⚠️ **Excluded from {set_tag} check:** {', '.join(blocked_notes)} *(not included in results)*"
-                    if blocked_notes
-                    else ""
-                )
 
                 if best_offer is None:
-                    # During 0-token interactive checks, fall back to latest verified UK retailer price if recorded
                     latest = self.db.get_latest_price(item.id) if not scheduled and not force_refresh else None
                     rec_retailer = UKRetailer.OTHER
                     if latest is not None:
@@ -1251,68 +634,46 @@ class LegoTrackerBot(discord.Client):
                             rec_retailer = UKRetailer.OTHER
 
                     if latest is not None and rec_retailer in APPROVED_UK_RETAILERS:
-                        eff_rrp = rrp if rrp > 0 else latest.price_gbp
+                        eff_rrp = item.rrp_gbp if item.rrp_gbp > 0 else latest.price_gbp
                         hist_totals = [h.total_gbp for h in self.db.get_price_history(item.id, limit=90)]
                         cached_analysis = analyze_price(
                             rrp_gbp=eff_rrp,
                             item_price_gbp=latest.price_gbp,
                             shipping_gbp=latest.shipping_gbp,
                             historical_totals_gbp=hist_totals,
-                            is_retiring=is_retiring,
+                            is_retiring=item.is_retiring,
                         )
-                        icon = (
-                            "🟢"
-                            if "BUY NOW" in cached_analysis.verdict
-                            else ("🟡" if "GOOD" in cached_analysis.verdict or "SOON" in cached_analysis.verdict else "🟠")
-                        )
-                        fallback_url: Optional[str] = (
-                            item.url
-                            if item.url and detect_retailer_from_url(item.url) == rec_retailer
-                            else None
-                        )
+                        fallback_url = item.url if item.url and detect_retailer_from_url(item.url) == rec_retailer else None
                         if not fallback_url and rec_retailer == UKRetailer.AMAZON_UK and item.set_number:
-                            clean_num = item.set_number.strip().split("-")[0]
-                            fallback_url = self.db.get_amazon_dp_urls().get(clean_num)
+                            fallback_url = self.db.get_amazon_dp_urls().get(item.set_number.strip().split("-")[0])
                         if not fallback_url and item.set_number:
+                            resolved_name = clean_set_display_name(item.name, item.set_number) or item.name
                             fallback_url = dict(build_uk_search_urls(resolved_name, item.set_number)).get(rec_retailer)
-                        if not fallback_url:
-                            fallback_url = item.url
-                        verdict_line = (
-                            f"{icon} **{cached_analysis.verdict}** — [View Deal →]({fallback_url})"
-                            if fallback_url
-                            else f"{icon} **{cached_analysis.verdict}**"
+                        embeds = build_price_card(
+                            item,
+                            cached_analysis,
+                            rec_retailer,
+                            mode="cached",
+                            offer_url=fallback_url or item.url,
+                            recorded_at=latest.recorded_at,
+                            excluded_notes=blocked_notes,
                         )
                         await _emit(
-                            make_status_embed(
-                                f"🧩 {title}",
-                                (
-                                    f"{cat_line}"
-                                    f"## 🏷️ Last Verified Price: £{cached_analysis.total_gbp:.2f}\n"
-                                    f"⚠️ *Live stores were unavailable — this saved price may not be up-to-date. Click **Re-check** to try again.*\n"
-                                    f"### Normal RRP: £{cached_analysis.rrp_gbp:.2f}  •  {format_discount_badge(cached_analysis.discount_pct)}\n"
-                                    f"📍 **Seller:** {rec_retailer.display_name} *(recorded `{latest.recorded_at[:10]}`)*\n"
-                                    f"{verdict_line}{excluded_line}"
-                                ),
-                                color=discord.Color.blue(),
-                                image_url=box_art,
-                                footer="Cached DB price • Click Re-check for a fresh scan",
-                            ),
+                            embeds[0],
                             item.set_number,
+                            deal_url=fallback_url or item.url,
+                            retailer_name=rec_retailer.display_name,
                         )
                         return
 
-                    rrp_line = f"💷 **Normal RRP:** £{rrp:.2f}\n" if rrp > 0 else ""
+                    rrp_line = f"💷 **Normal RRP:** £{item.rrp_gbp:.2f}\n" if item.rrp_gbp > 0 else ""
                     diag = "\n".join(f"• {n}" for n in notes[:5]) if notes else "No approved UK retailers had stock."
                     await _emit(
                         make_status_embed(
                             f"🧩 {title}",
-                            (
-                                f"{cat_line}{rrp_line}"
-                                f"⚠️ **No live in-stock UK offers found right now**\n"
-                                f"*Sources checked:*\n{diag}"
-                            ),
+                            f"{rrp_line}⚠️ **No live in-stock UK offers found right now**\n*Sources checked:*\n{diag}",
                             color=discord.Color.orange(),
-                            image_url=box_art,
+                            thumbnail_url=box_art,
                             footer="Checked approved UK retailers • GBP (£) inc. delivery",
                         ),
                         item.set_number,
@@ -1320,9 +681,7 @@ class LegoTrackerBot(discord.Client):
                     await _update_status(f"ℹ️ **{title}** had no good deals *(no in-stock UK offers found)*.")
                     return
 
-                if rrp <= 0:
-                    rrp = best_offer.item_price_gbp
-
+                rrp = item.rrp_gbp if item.rrp_gbp > 0 else best_offer.item_price_gbp
                 prev_low = self.db.get_historical_low(item.id)
                 is_all_time_low = prev_low is not None and best_offer.total_gbp < prev_low
 
@@ -1346,87 +705,34 @@ class LegoTrackerBot(discord.Client):
                     item_price_gbp=best_offer.item_price_gbp,
                     shipping_gbp=best_offer.shipping_gbp,
                     historical_totals_gbp=hist_totals,
-                    is_retiring=is_retiring,
+                    is_retiring=item.is_retiring,
                 )
 
-                icon = "🟢" if "BUY NOW" in analysis.verdict else ("🟡" if "GOOD" in analysis.verdict or "SOON" in analysis.verdict else "🟠")
-                color = discord.Color.green() if "BUY NOW" in analysis.verdict else (discord.Color.gold() if "GOOD" in analysis.verdict or "SOON" in analysis.verdict else discord.Color.blue())
-                ship_line = (
-                    f"*(incl. £{best_offer.shipping_gbp:.2f} delivery — £{best_offer.item_price_gbp:.2f} item)*\n"
-                    if best_offer.shipping_gbp > 0
-                    else ""
+                embeds = build_price_card(
+                    item,
+                    analysis,
+                    best_offer.retailer,
+                    mode="check",
+                    shipping_note=best_offer.shipping_note,
+                    offer_url=best_offer.url,
+                    excluded_notes=blocked_notes,
+                    is_all_time_low=is_all_time_low,
                 )
                 await _emit(
-                    make_status_embed(
-                        f"🧩 {title}",
-                        (
-                            f"{cat_line}"
-                            f"## 🏷️ Deal Price: £{analysis.total_gbp:.2f}\n"
-                            f"{ship_line}"
-                            f"### Normal RRP: £{analysis.rrp_gbp:.2f}  •  {format_discount_badge(analysis.discount_pct)}\n"
-                            f"📍 **Seller:** {best_offer.retailer.display_name}\n"
-                            f"{icon} **{analysis.verdict}** — [View Deal →]({best_offer.url}){excluded_line}"
-                        ),
-                        color=color,
-                        image_url=box_art,
-                        footer="Prices in GBP (£) including estimated UK delivery",
-                    ),
+                    embeds[0],
                     item.set_number,
+                    deal_url=best_offer.url,
+                    retailer_name=best_offer.retailer.display_name,
                 )
 
-                hit_target = item.target_price_gbp is not None and analysis.total_gbp <= item.target_price_gbp
-                hit_discount = analysis.discount_pct >= item.min_discount_pct
-                if not (hit_target or hit_discount):
-                    if item.last_alert_price_gbp is not None:
-                        self.db.reset_alert_state(item.id)
-                    await _update_status(
-                        f"ℹ️ **{title}** had no good deals "
-                        f"*(best: £{analysis.total_gbp:.2f} at {best_offer.retailer.display_name}, {format_discount_short(analysis.discount_pct)})*."
-                    )
-                elif self.db.should_alert(
-                    item, analysis.total_gbp, self.config.alert_cooldown_hours
-                ):
-                    await _update_status(f"🔥 Good deal spotted for **{title}**!")
-                    series = list(reversed([h.total_gbp for h in self.db.get_price_history(item.id, limit=30)]))
-                    chart_bytes = generate_price_chart(series, rrp) if len(series) >= 2 else None
-                    embeds = build_alert_embeds(
-                        item,
-                        analysis,
-                        best_offer.retailer,
-                        best_offer.shipping_note,
-                        offer_url=best_offer.url,
-                        is_all_time_low=is_all_time_low,
-                        has_chart=chart_bytes is not None,
-                    )
-                    if isinstance(channel, discord.abc.Messageable):
-                        deal_summary = (
-                            f"🔥 **{title}** — **£{analysis.total_gbp:.2f}** "
-                            f"at {best_offer.retailer.display_name} ({format_discount_short(analysis.discount_pct)})"
-                        )
-                        if self.dev_mode:
-                            alert_content = f"🛠️ [DEV MODE] {deal_summary} *(pings suppressed)*"
-                            allowed = discord.AllowedMentions.none()
-                        else:
-                            pings = format_pings(
-                                self.config.user_id,
-                                item,
-                                extra_user_ids=self.config.extra_notify_user_ids,
-                            )
-                            alert_content = f"{pings} {deal_summary}"
-                            allowed = discord.AllowedMentions.all()
-                        if chart_bytes:
-                            file = discord.File(io.BytesIO(chart_bytes), filename="chart.png")
-                            await channel.send(
-                                content=alert_content, embeds=embeds, file=file, allowed_mentions=allowed
-                            )
-                        else:
-                            await channel.send(content=alert_content, embeds=embeds, allowed_mentions=allowed)
-                        self.db.mark_alerted(item.id, analysis.total_gbp)
-                else:
-                    await _update_status(
-                        f"ℹ️ **{title}** is still on deal (**£{analysis.total_gbp:.2f}** at "
-                        f"{best_offer.retailer.display_name} — alert cooldown active)."
-                    )
+                await self._notify_if_deal(
+                    item,
+                    analysis,
+                    best_offer,
+                    is_all_time_low=is_all_time_low,
+                    channel=channel,
+                    update_status=_update_status,
+                )
 
         await asyncio.gather(*(_check_one(idx, it) for idx, it in enumerate(items)))
         self._save_cooldowns()
@@ -1445,7 +751,7 @@ class LegoTrackerBot(discord.Client):
                     f"📈 Price History: {format_item_title(item)}",
                     "No price history recorded yet. Run `/check` to record today's price!",
                     color=discord.Color.gold(),
-                    image_url=img,
+                    thumbnail_url=img,
                 ),
                 None,
             )
@@ -1489,7 +795,7 @@ class LegoTrackerBot(discord.Client):
         ) -> list[app_commands.Choice[str]]:
             query = current.lower().strip()
             choices: list[app_commands.Choice[str]] = []
-            for item in self.db.list_items():
+            for item in self.db.list_items(include_retired=True):
                 if not item.set_number:
                     continue
                 label = format_item_title(item)[:100]
@@ -1520,11 +826,13 @@ class LegoTrackerBot(discord.Client):
                 clean_num = set_number.strip().split("-")[0]
                 existing = self.db.get_item_by_set_number(clean_num)
                 if existing:
+                    if existing.status == "retired":
+                        self.db.restore_item(existing.id)
                     embed = make_status_embed(
                         "Already on Wishlist",
                         f"**{format_item_title(existing)}** is already tracked.",
                         color=discord.Color.gold(),
-                        image_url=existing.image_url or default_box_art_url(clean_num),
+                        thumbnail_url=existing.image_url or default_box_art_url(clean_num),
                     )
                     await interaction.followup.send(embed=embed)
                     return
@@ -1581,8 +889,8 @@ class LegoTrackerBot(discord.Client):
                         f"🔔 **Notify:** {format_pings(self.config.user_id, item, self.config.extra_notify_user_ids)}"
                     ),
                     color=discord.Color.green(),
-                    image_url=box_art,
-                    footer="Saved to wishlist.json",
+                    thumbnail_url=box_art,
+                    footer="Saved to wishlist",
                 )
                 await interaction.followup.send(embed=embed)
             except asyncio.TimeoutError:
@@ -1601,6 +909,60 @@ class LegoTrackerBot(discord.Client):
         async def cmd_list(interaction: discord.Interaction) -> None:
             view = WishlistView(self)
             await interaction.response.send_message(embed=view.build_embed(), view=view)
+
+        @self.tree.command(name="set", description="Open the detail card & quick actions for a tracked LEGO set")
+        @app_commands.describe(set_number="LEGO set number (e.g. 10316)")
+        @app_commands.autocomplete(set_number=_set_number_autocomplete)
+        async def cmd_set(interaction: discord.Interaction, set_number: str) -> None:
+            item = self.db.get_item_by_set_number(set_number)
+            if not item:
+                await interaction.response.send_message(
+                    embed=make_error_embed("Not Found", f"Set #{set_number} is not on your wishlist."),
+                    ephemeral=True,
+                )
+                return
+            view = SetDetailView(self, item)
+            await interaction.response.send_message(embed=view.build_embed(), view=view)
+
+        @self.tree.command(name="deals", description="Show tracked sets currently at or below target / on sale")
+        async def cmd_deals(interaction: discord.Interaction) -> None:
+            items = self.db.list_items()
+            deals: list[tuple[float, str]] = []
+            for item in items:
+                latest = self.db.get_latest_price(item.id)
+                if not latest or item.rrp_gbp <= 0:
+                    continue
+                disc_pct = ((item.rrp_gbp - latest.total_gbp) / item.rrp_gbp) * 100
+                hit_target = item.target_price_gbp is not None and latest.total_gbp <= item.target_price_gbp
+                hit_disc = disc_pct >= item.min_discount_pct
+                if hit_target or hit_disc:
+                    tag = " 🎯" if hit_target else ""
+                    ret = " ⚠️" if item.is_retiring else ""
+                    deals.append(
+                        (
+                            disc_pct,
+                            f"🟢 **{format_item_title(item)}** — **£{latest.total_gbp:.2f}** "
+                            f"`{format_discount_short(disc_pct)}` at {latest.retailer}{tag}{ret}",
+                        )
+                    )
+            if not deals:
+                await interaction.response.send_message(
+                    embed=make_status_embed(
+                        "🏷️ Current UK LEGO Deals",
+                        "No tracked sets are currently hitting your target price or minimum discount.",
+                        color=discord.Color.blue(),
+                    )
+                )
+                return
+            deals.sort(key=lambda d: d[0], reverse=True)
+            await interaction.response.send_message(
+                embed=make_status_embed(
+                    f"🔥 Active Deals ({len(deals)})",
+                    "\n".join(line for _, line in deals[:20]),
+                    color=discord.Color.green(),
+                    footer="Sorted by highest % off RRP",
+                )
+            )
 
         @self.tree.command(name="check", description="Check live UK prices for one set or all sets")
         @app_commands.describe(
@@ -1691,7 +1053,7 @@ class LegoTrackerBot(discord.Client):
                     f"• **Retiring Soon:** {'Yes' if updated.is_retiring else 'No'}"
                 ),
                 color=discord.Color.green(),
-                image_url=updated.image_url or default_box_art_url(updated.set_number),
+                thumbnail_url=updated.image_url or default_box_art_url(updated.set_number),
             )
             await interaction.response.send_message(embed=embed)
 
@@ -1712,7 +1074,7 @@ class LegoTrackerBot(discord.Client):
                 "🗑️ Removed from Wishlist",
                 f"Removed **{format_item_title(item)}** from your wishlist.",
                 color=discord.Color.orange(),
-                image_url=item.image_url or default_box_art_url(item.set_number),
+                thumbnail_url=item.image_url or default_box_art_url(item.set_number),
             )
             await interaction.response.send_message(embed=embed)
 
@@ -1782,7 +1144,7 @@ class LegoTrackerBot(discord.Client):
             embed = make_status_embed(
                 "🤖 LEGO Bot Status",
                 (
-                    f"⏱️ **Check Tick:** Every {self.config.check_interval_minutes} min (next {next_str} • ≥4h staleness queue)\n"
+                    f"⏱️ **Check Tick:** Every {self.config.check_interval_minutes} min (next {next_str} • ≥{self.config.stale_check_hours:g}h staleness queue)\n"
                     f"🧩 **Tracked Sets:** {len(items)} ({retiring_count} retiring soon)\n"
                     f"💾 **Price Cache:** {cached_count} set(s) cached ({cache_ttl // 60}m TTL)\n"
                     f"🛠️ **Dev Mode:** {dev_str}\n"
@@ -1815,11 +1177,11 @@ class LegoTrackerBot(discord.Client):
             )
             await interaction.response.send_message(embed=embed)
 
-        @bot_group.command(name="maintenance", description="Run maintenance: clear price cache, reset store cooldowns, or clean history")
+        @bot_group.command(name="maintenance", description="Clear price cache, reset store cooldowns, clean history, or export wishlist")
         @app_commands.describe(action="Which maintenance task to run")
         async def bot_maintenance(
             interaction: discord.Interaction,
-            action: Literal["clear_cache", "clear_cooldowns", "clean_history"],
+            action: Literal["clear_cache", "clear_cooldowns", "clean_history", "export_wishlist"],
         ) -> None:
             if not is_admin_user(interaction, self.config.user_id):
                 await interaction.response.send_message(
@@ -1834,6 +1196,7 @@ class LegoTrackerBot(discord.Client):
                     f"Removed **{cleared}** cached set(s) from the 30-minute memory cache.",
                     color=discord.Color.green(),
                 )
+                await interaction.response.send_message(embed=embed)
             elif action == "clear_cooldowns":
                 cleared_stores = clear_cooldowns()
                 self._save_cooldowns()
@@ -1842,7 +1205,34 @@ class LegoTrackerBot(discord.Client):
                     if cleared_stores
                     else "No stores were in cooldown (all block streaks reset)."
                 )
-                embed = make_status_embed("🔄 Store Cooldowns Cleared", msg, color=discord.Color.green())
+                await interaction.response.send_message(
+                    embed=make_status_embed("🔄 Store Cooldowns Cleared", msg, color=discord.Color.green())
+                )
+            elif action == "export_wishlist":
+                data = [
+                    {
+                        "name": it.name,
+                        "set_number": it.set_number,
+                        "category": it.category,
+                        "rrp_gbp": it.rrp_gbp if it.rrp_gbp > 0 else None,
+                        "target_price_gbp": it.target_price_gbp,
+                        "min_discount_pct": it.min_discount_pct,
+                        "is_retiring": it.is_retiring,
+                        "image_url": it.image_url,
+                        "notify_user_ids": list(it.notify_user_ids),
+                    }
+                    for it in self.db.list_items()
+                ]
+                raw = json.dumps(data, indent=2)
+                Path(self.config.wishlist_path).write_text(raw, encoding="utf-8")
+                await interaction.response.send_message(
+                    embed=make_status_embed(
+                        "📤 Wishlist Exported",
+                        f"Exported **{len(data)}** active set(s) to `{self.config.wishlist_path}`.",
+                        color=discord.Color.green(),
+                    ),
+                    file=discord.File(io.BytesIO(raw.encode("utf-8")), filename="wishlist.json"),
+                )
             else:
                 deleted_rows, reset_items = self.db.purge_implausible_history()
                 pruned_old = self.db.prune_old_history(retention_days=180)
@@ -1855,13 +1245,13 @@ class LegoTrackerBot(discord.Client):
                     ),
                     color=discord.Color.green(),
                 )
-            await interaction.response.send_message(embed=embed)
+                await interaction.response.send_message(embed=embed)
 
-        @bot_group.command(name="update", description="Pull the latest code from GitHub, sync dependencies, and restart the bot")
+        @bot_group.command(name="update", description="Pull the latest code from GitHub, sync dependencies, and restart (Owner only)")
         async def bot_update(interaction: discord.Interaction) -> None:
-            if not is_admin_user(interaction, self.config.user_id):
+            if interaction.user.id != self.config.user_id:
                 await interaction.response.send_message(
-                    embed=make_error_embed("Admin Only", "Only server admins can use `/bot` commands."),
+                    embed=make_error_embed("Owner Only", "Only the configured bot owner can run `/bot update`."),
                     ephemeral=True,
                 )
                 return
@@ -1931,9 +1321,10 @@ class LegoTrackerBot(discord.Client):
                     embed=make_error_embed("Update Timed Out", "Update command took too long."),
                     ephemeral=True,
                 )
-            except Exception as exc:
+            except Exception:
+                logger.exception("bot update failed")
                 await interaction.followup.send(
-                    embed=make_error_embed("Update Error", str(exc)),
+                    embed=make_error_embed("Update Error", "Could not complete update. Check bot logs for details."),
                     ephemeral=True,
                 )
 

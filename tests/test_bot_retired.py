@@ -78,7 +78,10 @@ async def test_retired_set_auto_cleanup_and_ping():
         try:
             with patch("src.lego_bot.bot.lookup_set_metadata", new=AsyncMock(return_value=retired_meta)):
                 await bot.run_price_checks(set_number="10299")
-            assert bot.db.get_item_by_set_number("10299") is None
+            archived = bot.db.get_item_by_set_number("10299")
+            assert archived is not None
+            assert archived.status == "retired"
+            assert bot.db.list_items() == []
         finally:
             await bot.http_session.close()
             bot.db.close()
@@ -89,5 +92,5 @@ async def test_retired_set_auto_cleanup_and_ping():
         assert "<@111111>" in msg["content"]
         assert "<@222222>" in msg["content"]
         assert "retired" in msg["content"].lower()
-        assert "Removed Retired Set" in msg["embed"].title
+        assert "Archived Retired Set" in msg["embed"].title
         assert isinstance(msg["view"], RetiredSetView)

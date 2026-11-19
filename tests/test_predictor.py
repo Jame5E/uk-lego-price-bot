@@ -20,13 +20,25 @@ def test_mild_discount_wait():
         rrp_gbp=50.00,
         item_price_gbp=42.00,
         shipping_gbp=3.95,
+        historical_totals_gbp=[50.0, 40.0],
+        is_retiring=False,
+    )
+    # Total is 45.95 -> 8.1% off RRP, above tracked low 40.0
+    assert analysis.total_gbp == 45.95
+    assert analysis.verdict == "WAIT"
+    assert "likely to drop" in analysis.forecast.lower()
+
+
+def test_all_time_low_under_10_pct_gets_lowest_seen():
+    analysis = analyze_price(
+        rrp_gbp=50.00,
+        item_price_gbp=42.00,
+        shipping_gbp=3.95,
         historical_totals_gbp=[50.0, 48.0],
         is_retiring=False,
     )
-    # Total is 45.95 -> 8.1% off RRP
-    assert analysis.total_gbp == 45.95
-    assert analysis.verdict == "WAIT"
-    assert "likely to drop more" in analysis.forecast.lower()
+    assert analysis.verdict == "LOWEST SEEN"
+    assert "lowest tracked" in analysis.forecast.lower()
 
 
 def test_retiring_set_verdict():

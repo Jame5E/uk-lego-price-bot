@@ -10,7 +10,9 @@ A Discord bot that monitors your favourite LEGO sets/pieces in **GBP (£)** acro
 - **Drop More vs. Go Back Up Forecast:** Compares the total landed price against RRP, tracked historical low, 90-day average, and whether the set is retiring soon.
 - **Slash Commands:**
   - `/add` — Add a LEGO set to your wishlist using its set number
-  - `/list` — Compact, paginated wishlist with quick set inspector & edit/check buttons
+  - `/list` — Compact, paginated & sortable wishlist with quick set inspector
+  - `/set` — Open a set's detail card (price, targets, personal threshold, buttons)
+  - `/deals` — Show all tracked sets currently at or below target / on sale
   - `/check` — Check live UK prices for a set (or all sets, Admin only)
   - `/edit` — Update target price, minimum discount %, or retiring status
   - `/history` — View recorded GBP price history and chart for a set

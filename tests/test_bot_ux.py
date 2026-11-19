@@ -75,7 +75,7 @@ def test_simplified_commands_and_admin_permissions():
         try:
             bot._register_commands()
             names = {cmd.name for cmd in bot.tree.get_commands()}
-            assert names == {"add", "list", "check", "edit", "remove", "pings", "history", "bot"}
+            assert names == {"add", "list", "set", "deals", "check", "edit", "remove", "pings", "history", "bot"}
 
             bot_cmd = bot.tree.get_command("bot")
             assert bot_cmd is not None
@@ -93,7 +93,7 @@ def test_pinned_status_includes_store_health():
         bot = LegoTrackerBot(_make_config(tmp))
         try:
             text = bot._format_status_text("Checked **Rivendell**.")
-            assert "Store Health:" in text
+            assert "Stores:" in text
             assert "Scheduled Check Status" in text
         finally:
             bot.db.close()
@@ -105,13 +105,13 @@ async def test_wishlist_view_paginates_compactly():
         bot = LegoTrackerBot(_make_config(tmp))
         try:
             for i in range(12):
-                bot.db.add_item(name=f"Set {i}", rrp_gbp=50.0, set_number=str(10000 + i))
+                bot.db.add_item(name=f"Set {i:02d}", rrp_gbp=50.0, set_number=str(10000 + i))
 
             view = WishlistView(bot, page=0)
             embed_p1 = view.build_embed()
             assert "(12 sets)" in (embed_p1.title or "")
             assert "Page 1/2" in (embed_p1.title or "")
-            assert "Set 0" in (embed_p1.description or "")
+            assert "Set 00" in (embed_p1.description or "")
             assert "Set 11" not in (embed_p1.description or "")
 
             view_p2 = WishlistView(bot, page=1)
@@ -120,3 +120,23 @@ async def test_wishlist_view_paginates_compactly():
             assert "Set 11" in (embed_p2.description or "")
         finally:
             bot.db.close()
+
+
+def test_quiet_hours_and_link_buttons():
+    from datetime import datetime, timezone
+    from src.lego_bot.scheduler import is_quiet_hours
+    from src.lego_bot.views import DealLinkView
+
+    late = datetime(2026, 1, 15, 23, 30, tzinfo=timezone.utc)
+    morning = datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc)
+    assert is_quiet_hours(23, 7, now=late) is True
+    assert is_quiet_hours(23, 7, now=morning) is False
+
+    @pytest.mark.asyncio
+    async def _check_btn():
+        v = DealLinkView("https://www.amazon.co.uk/dp/B001", "Amazon UK")
+        assert len(v.children) == 1
+        btn = v.children[0]
+        assert isinstance(btn, discord.ui.Button)
+        assert btn.style == discord.ButtonStyle.link
+        assert btn.url == "https://www.amazon.co.uk/dp/B001"

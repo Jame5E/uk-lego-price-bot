@@ -22,6 +22,9 @@ class Config:
     serpapi_monthly_limit: int = 250
     extra_notify_user_ids: tuple[str, ...] = ("942902769319292948",)
     proxy_url: str | None = None
+    stale_check_hours: float = 4.0
+    quiet_hours_start: int = 23
+    quiet_hours_end: int = 7
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -60,4 +63,7 @@ class Config:
             serpapi_monthly_limit=serp_limit,
             extra_notify_user_ids=extra_ids,
             proxy_url=os.getenv("PROXY_URL", "").strip() or None,
+            stale_check_hours=max(0.5, float(os.getenv("STALE_CHECK_HOURS", "4.0"))),
+            quiet_hours_start=int(os.getenv("QUIET_HOURS_START", "23")) % 24,
+            quiet_hours_end=int(os.getenv("QUIET_HOURS_END", "7")) % 24,
         )

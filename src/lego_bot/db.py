@@ -27,6 +27,8 @@ class TrackedItem:
     last_alert_price_gbp: float | None
     last_alert_at: str | None
     created_at: str
+    status: str = "active"
+    piece_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -71,7 +73,9 @@ class PriceDatabase:
                 notify_user_ids TEXT NOT NULL DEFAULT '[]',
                 last_alert_price_gbp REAL,
                 last_alert_at TEXT,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                piece_count INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS price_history (
@@ -97,6 +101,15 @@ class PriceDatabase:
                 PRIMARY KEY (provider, month_key)
             );
 
+            CREATE TABLE IF NOT EXISTS user_thresholds (
+                item_id INTEGER NOT NULL,
+                user_id TEXT NOT NULL,
+                target_price_gbp REAL,
+                min_discount_pct REAL,
+                PRIMARY KEY (item_id, user_id),
+                FOREIGN KEY (item_id) REFERENCES tracked_items(id) ON DELETE CASCADE
+            );
+
             CREATE INDEX IF NOT EXISTS idx_price_history_item_time
             ON price_history (item_id, recorded_at DESC);
             """
@@ -111,6 +124,10 @@ class PriceDatabase:
             self._conn.execute("ALTER TABLE tracked_items ADD COLUMN category TEXT")
         if "last_checked_at" not in cols:
             self._conn.execute("ALTER TABLE tracked_items ADD COLUMN last_checked_at TEXT")
+        if "status" not in cols:
+            self._conn.execute("ALTER TABLE tracked_items ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+        if "piece_count" not in cols:
+            self._conn.execute("ALTER TABLE tracked_items ADD COLUMN piece_count INTEGER")
         self._conn.commit()
 
     @staticmethod
@@ -147,6 +164,8 @@ class PriceDatabase:
             last_alert_price_gbp=row["last_alert_price_gbp"],
             last_alert_at=row["last_alert_at"],
             created_at=row["created_at"],
+            status=row["status"] if "status" in keys and row["status"] else "active",
+            piece_count=row["piece_count"] if "piece_count" in keys else None,
         )
 
     def add_item(
@@ -262,11 +281,81 @@ class PriceDatabase:
         self._conn.commit()
         return self.get_item(item_id)
 
-    def list_items(self) -> list[TrackedItem]:
-        rows = self._conn.execute(
-            "SELECT * FROM tracked_items ORDER BY id ASC"
-        ).fetchall()
+    def archive_item(self, item_id: int) -> TrackedItem | None:
+        self._conn.execute("UPDATE tracked_items SET status = 'retired' WHERE id = ?", (item_id,))
+        self._conn.commit()
+        return self.get_item(item_id)
+
+    def restore_item(self, item_id: int) -> TrackedItem | None:
+        self._conn.execute("UPDATE tracked_items SET status = 'active' WHERE id = ?", (item_id,))
+        self._conn.commit()
+        return self.get_item(item_id)
+
+    def list_items(self, *, include_retired: bool = False) -> list[TrackedItem]:
+        if include_retired:
+            rows = self._conn.execute("SELECT * FROM tracked_items ORDER BY status ASC, id ASC").fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM tracked_items WHERE status != 'retired' ORDER BY id ASC"
+            ).fetchall()
         return [self._row_to_item(r) for r in rows]
+
+    def set_user_threshold(
+        self,
+        item_id: int,
+        user_id: str,
+        *,
+        target_price_gbp: float | None = None,
+        min_discount_pct: float | None = None,
+    ) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO user_thresholds (item_id, user_id, target_price_gbp, min_discount_pct)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(item_id, user_id) DO UPDATE SET
+                target_price_gbp = excluded.target_price_gbp,
+                min_discount_pct = excluded.min_discount_pct
+            """,
+            (
+                item_id,
+                str(user_id),
+                round(target_price_gbp, 2) if target_price_gbp and target_price_gbp > 0 else None,
+                round(min_discount_pct, 1) if min_discount_pct is not None else None,
+            ),
+        )
+        self._conn.commit()
+
+    def get_user_thresholds(self, item_id: int) -> dict[str, tuple[float | None, float | None]]:
+        rows = self._conn.execute(
+            "SELECT user_id, target_price_gbp, min_discount_pct FROM user_thresholds WHERE item_id = ?",
+            (item_id,),
+        ).fetchall()
+        return {
+            str(r["user_id"]): (r["target_price_gbp"], r["min_discount_pct"])
+            for r in rows
+        }
+
+    def get_price_days_ago(self, item_id: int, days_ago: int = 7) -> PriceRecord | None:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
+        row = self._conn.execute(
+            """
+            SELECT * FROM price_history
+            WHERE item_id = ? AND recorded_at <= ?
+            ORDER BY recorded_at DESC LIMIT 1
+            """,
+            (item_id, cutoff),
+        ).fetchone()
+        if not row:
+            return None
+        return PriceRecord(
+            id=row["id"],
+            item_id=row["item_id"],
+            price_gbp=row["price_gbp"],
+            shipping_gbp=row["shipping_gbp"],
+            total_gbp=row["total_gbp"],
+            retailer=row["retailer"],
+            recorded_at=row["recorded_at"],
+        )
 
     def remove_item(self, item_id: int) -> bool:
         cur = self._conn.execute(
