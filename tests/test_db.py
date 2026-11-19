@@ -30,6 +30,12 @@ def test_db_crud_and_cooldown():
     # Further drop by >= £1 should re-alert immediately
     assert db.should_alert(updated, 535.00, cooldown_hours=12) is True
 
+    # When deal ends and returns to RRP, reset allows future deals to alert again
+    db.reset_alert_state(item.id)
+    reset_item = db.get_item(item.id)
+    assert reset_item is not None
+    assert db.should_alert(reset_item, 540.00, cooldown_hours=12) is True
+
     assert db.remove_item(item.id) is True
     assert db.list_items() == []
     db.close()
