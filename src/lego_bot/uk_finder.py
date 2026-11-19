@@ -839,8 +839,18 @@ async def find_best_uk_offer(
     prefer_click_and_collect: bool = False,
     keepa_api_key: str | None = None,
     proxy_url: str | None = None,
+    force_refresh: bool = False,
 ) -> tuple[UKOffer | None, list[str]]:
     """Check direct URL or multiple UK retailers concurrently and return the cheapest in-stock landed offer."""
+    clean_key_id = set_number.strip().split("-")[0] if set_number else name.strip().lower()
+    cache_key = f"{clean_key_id}|{int(has_amazon_prime)}|{int(prefer_click_and_collect)}|{direct_url or ''}"
+    now = time.monotonic()
+    if not force_refresh and cache_key in _PRICE_CACHE:
+        cached_at, cached_offer, cached_notes = _PRICE_CACHE[cache_key]
+        if now - cached_at < _PRICE_CACHE_TTL_SECONDS:
+            return cached_offer, [*cached_notes, "Served from 10m in-memory cache"]
+        _PRICE_CACHE.pop(cache_key, None)
+
     offers: list[UKOffer] = []
     notes: list[str] = []
 
@@ -976,4 +986,5 @@ async def find_best_uk_offer(
         return None, notes
 
     best = min(offers, key=lambda o: o.total_gbp)
+    _PRICE_CACHE[cache_key] = (time.monotonic(), best, list(notes))
     return best, notes
