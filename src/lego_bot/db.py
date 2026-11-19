@@ -109,6 +109,8 @@ class PriceDatabase:
             self._conn.execute("ALTER TABLE tracked_items ADD COLUMN notify_user_ids TEXT NOT NULL DEFAULT '[]'")
         if "category" not in cols:
             self._conn.execute("ALTER TABLE tracked_items ADD COLUMN category TEXT")
+        if "last_checked_at" not in cols:
+            self._conn.execute("ALTER TABLE tracked_items ADD COLUMN last_checked_at TEXT")
         self._conn.commit()
 
     @staticmethod

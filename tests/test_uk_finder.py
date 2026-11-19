@@ -490,7 +490,8 @@ def test_lookup_set_metadata_checks_lego_uk_when_brickset_not_retiring():
 
 def test_serpapi_not_called_when_direct_offer_exists_or_not_blocked():
     from unittest.mock import AsyncMock, patch
-    from src.lego_bot.shipping import UKOffer, UKRetailer
+    from src.lego_bot.shipping import UKRetailer
+    from src.lego_bot.uk_finder import UKOffer
 
     _uk_mod.clear_cooldowns()
     sample_offer = UKOffer(

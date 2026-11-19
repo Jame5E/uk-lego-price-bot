@@ -1102,6 +1102,7 @@ class LegoTrackerBot(discord.Client):
                     )
 
         await asyncio.gather(*(_check_one(idx, it) for idx, it in enumerate(items)))
+        self._save_cooldowns()
 
         if scheduled and not set_number:
             await self._maybe_send_weekly_summary(channel)

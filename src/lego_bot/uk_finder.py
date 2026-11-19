@@ -49,7 +49,8 @@ GENERIC_BRICKSET_SUBTHEMES = {
 }
 
 # Per-source circuit breaker for any direct store that returns repeated 403/429
-_SOURCE_COOLDOWN_TIERS: tuple[float, ...] = (180.0, 600.0, 900.0)
+# Escalates 3m -> 10m -> 1h -> 6h on repeated blocks; resets on the next successful fetch
+_SOURCE_COOLDOWN_TIERS: tuple[float, ...] = (180.0, 600.0, 3600.0, 21600.0)
 _SOURCE_OUTAGE_ALERT_SECONDS = 7200.0
 _SOURCE_FAIL_STREAK: dict[str, int] = {}
 _SOURCE_COOLDOWN_TIER: dict[str, int] = {}
