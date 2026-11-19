@@ -595,6 +595,7 @@ class LegoTrackerBot(discord.Client):
     @tasks.loop(minutes=30)
     async def price_check_loop(self) -> None:
         try:
+            await asyncio.sleep(random.uniform(5.0, 90.0))
             await asyncio.wait_for(self.run_price_checks(scheduled=True), timeout=600.0)
             outages = pop_long_outage_sources()
             if outages:
