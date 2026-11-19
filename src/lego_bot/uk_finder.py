@@ -51,6 +51,33 @@ def _record_source_ok(source_key: str) -> None:
     _SOURCE_COOLDOWN_UNTIL.pop(source_key, None)
 
 
+# In-memory price cache (10 minutes) to avoid redundant scraping & proxy bandwidth
+_PRICE_CACHE_TTL_SECONDS = 600.0
+_PRICE_CACHE: dict[str, tuple[float, "UKOffer", list[str]]] = {}
+
+
+def get_source_health() -> dict[str, int]:
+    """Return remaining cooldown seconds for any source currently cooled down."""
+    now = time.monotonic()
+    active: dict[str, int] = {}
+    for key, until in list(_SOURCE_COOLDOWN_UNTIL.items()):
+        if until > now:
+            active[key] = int(until - now)
+        else:
+            _SOURCE_COOLDOWN_UNTIL.pop(key, None)
+            _SOURCE_FAIL_STREAK.pop(key, None)
+    return active
+
+
+def get_price_cache_stats() -> tuple[int, int]:
+    """Return (active_cached_entries, ttl_seconds)."""
+    now = time.monotonic()
+    for key, (ts, _, _) in list(_PRICE_CACHE.items()):
+        if now - ts >= _PRICE_CACHE_TTL_SECONDS:
+            _PRICE_CACHE.pop(key, None)
+    return len(_PRICE_CACHE), int(_PRICE_CACHE_TTL_SECONDS)
+
+
 @dataclass(frozen=True)
 class SetMetadata:
     name: str | None
