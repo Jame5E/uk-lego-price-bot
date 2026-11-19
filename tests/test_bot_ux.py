@@ -122,21 +122,60 @@ async def test_wishlist_view_paginates_compactly():
             bot.db.close()
 
 
-def test_quiet_hours_and_link_buttons():
+@pytest.mark.asyncio
+async def test_quiet_hours_and_link_buttons():
     from datetime import datetime, timezone
     from src.lego_bot.scheduler import is_quiet_hours
-    from src.lego_bot.views import DealLinkView
+    from src.lego_bot.views import CheckResultView, DealLinkView
 
     late = datetime(2026, 1, 15, 23, 30, tzinfo=timezone.utc)
     morning = datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc)
     assert is_quiet_hours(23, 7, now=late) is True
     assert is_quiet_hours(23, 7, now=morning) is False
 
-    @pytest.mark.asyncio
-    async def _check_btn():
-        v = DealLinkView("https://www.amazon.co.uk/dp/B001", "Amazon UK")
-        assert len(v.children) == 1
-        btn = v.children[0]
-        assert isinstance(btn, discord.ui.Button)
-        assert btn.style == discord.ButtonStyle.link
-        assert btn.url == "https://www.amazon.co.uk/dp/B001"
+    v = DealLinkView("https://www.amazon.co.uk/dp/B001", "Amazon UK")
+    assert len(v.children) == 1
+    btn = v.children[0]
+    assert isinstance(btn, discord.ui.Button)
+    assert btn.style == discord.ButtonStyle.link
+    assert btn.url == "https://www.amazon.co.uk/dp/B001"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        bot = LegoTrackerBot(_make_config(tmp))
+        try:
+            cv = CheckResultView(bot, "10316", deal_url="https://www.amazon.co.uk/dp/B001", retailer_name="Amazon UK")
+            link_btns = [c for c in cv.children if isinstance(c, discord.ui.Button) and c.style == discord.ButtonStyle.link]
+            assert len(link_btns) == 1
+            assert link_btns[0].url == "https://www.amazon.co.uk/dp/B001"
+        finally:
+            bot.db.close()
+
+
+@pytest.mark.asyncio
+async def test_set_detail_view_weekly_summary_and_user_thresholds():
+    from src.lego_bot.embeds import build_price_card
+    from src.lego_bot.scheduler import build_weekly_summary_embed
+    from src.lego_bot.views import SetDetailView
+
+    with tempfile.TemporaryDirectory() as tmp:
+        bot = LegoTrackerBot(_make_config(tmp))
+        try:
+            item = bot.db.add_item(name="Rivendell", rrp_gbp=429.99, set_number="10316", target_price_gbp=350.0)
+            bot.db.record_price(item.id, 339.99, 0.0, 339.99, "amazon_uk")
+            bot.db.set_user_threshold(item.id, "999999", target_price_gbp=300.0, min_discount_pct=30.0)
+            assert bot.db.get_user_thresholds(item.id)["999999"] == (300.0, 30.0)
+
+            detail = SetDetailView(bot, item)
+            d_embed = detail.build_embed()
+            assert "Rivendell" in (d_embed.title or "")
+            assert "<@999999>" in (d_embed.description or "")
+
+            analysis = analyze_price(rrp_gbp=429.99, item_price_gbp=339.99, shipping_gbp=0.0)
+            check_cards = build_price_card(item, analysis, UKRetailer.AMAZON_UK, mode="check", offer_url="https://example.com")
+            assert check_cards[0].thumbnail.url is not None
+            assert check_cards[0].image.url is None
+
+            summary = build_weekly_summary_embed(bot.db, bot.db.list_items())
+            assert "On Deal Now" in (summary.description or "")
+        finally:
+            bot.db.close()
