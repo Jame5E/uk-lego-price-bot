@@ -332,10 +332,8 @@ def build_uk_search_urls(name: str, set_number: str | None) -> list[tuple[UKReta
         urls.append((UKRetailer.LEGO_UK, f"https://www.lego.com/en-gb/product/{clean_num}"))
     urls.extend(
         [
-            (UKRetailer.ARGOS, f"https://www.argos.co.uk/search/{query}/"),
             (UKRetailer.SMYTHS, f"https://www.smythstoys.com/uk/en-gb/search/?text={query}"),
             (UKRetailer.JOHN_LEWIS, f"https://www.johnlewis.com/search?search-term={query}"),
-            (UKRetailer.AMAZON_UK, f"https://www.amazon.co.uk/s?k={query}"),
         ]
     )
     return urls
