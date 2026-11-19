@@ -404,7 +404,7 @@ async def _fetch_brickwatch_uk(
     clean_num = set_number.strip().split("-")[0]
     url = f"https://www.brickwatch.net/en-GB/set/{clean_num}/"
     try:
-        async with session.get(url, headers=DEFAULT_HEADERS, proxy=proxy_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+        async with session.get(url, headers=DEFAULT_HEADERS, proxy=proxy_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
             if resp.status != 200:
                 if resp.status in (202, 403, 429, 503):
                     _record_source_block("brickwatch_uk")
