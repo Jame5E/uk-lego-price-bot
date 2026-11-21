@@ -735,6 +735,7 @@ def parse_amazon_uk_search_html(
     *,
     rrp_gbp: float | None = None,
     has_amazon_prime: bool = False,
+    expected_name: str | None = None,
 ) -> list[UKOffer]:
     """Parse Amazon UK search HTML for genuine brand-new LEGO set offers."""
     clean_num = set_number.strip().split("-")[0]
@@ -760,15 +761,15 @@ def parse_amazon_uk_search_html(
                 continue
 
             title_recipe = card.find("div", attrs={"data-cy": "title-recipe"})
-            h2 = card.find("h2")
+            h2_els = card.find_all("h2")
             if title_recipe:
                 title = title_recipe.get_text(" ", strip=True)
-            elif h2:
-                title = h2.get_text(" ", strip=True)
+            elif h2_els:
+                title = " ".join(el.get_text(" ", strip=True) for el in h2_els)
             else:
-                title = card_text
-            if len(title) < 12 or clean_num not in title:
                 title = card_text[:280]
+            if len(title) < 8 or clean_num not in title:
+                continue
 
             price_spans = card.select("span.a-price:not([data-a-strike]) > span.a-offscreen")
             if not price_spans:
@@ -783,7 +784,7 @@ def parse_amazon_uk_search_html(
             else:
                 price = round(price, 2)
 
-            if not is_valid_lego_set_listing(title, clean_num, price, rrp_gbp):
+            if not is_valid_lego_set_listing(title, clean_num, price, rrp_gbp, expected_name=expected_name):
                 continue
 
             ship = estimate_uk_shipping(price, UKRetailer.AMAZON_UK, has_amazon_prime=has_amazon_prime)
@@ -809,6 +810,7 @@ def parse_amazon_uk_product_html(
     *,
     rrp_gbp: float | None = None,
     has_amazon_prime: bool = False,
+    expected_name: str | None = None,
 ) -> tuple[UKOffer | None, bool]:
     """Parse an Amazon UK /dp/{asin} product page to verify stock, exact price, and seller/delivery.
 
@@ -848,7 +850,7 @@ def parse_amazon_uk_product_html(
         price = float(m.group(1).replace(",", ""))
         price = round(price * 1.20, 2) if ex_vat_export else round(price, 2)
 
-        if not is_valid_lego_set_listing(title, clean_num, price, rrp_gbp):
+        if not is_valid_lego_set_listing(title, clean_num, price, rrp_gbp, expected_name=expected_name):
             return None, True
 
         explicit_delivery: str | None = None
@@ -1438,6 +1440,7 @@ async def find_best_uk_offer(
     best = offers[0]
 
     # Verify winning Amazon UK /dp/ offer on its product page (skipped if already fetched directly)
+    verified_dp = used_direct_dp
     if (
         not used_direct_dp
         and best.retailer == UKRetailer.AMAZON_UK
@@ -1459,8 +1462,10 @@ async def find_best_uk_offer(
                     clean_num,
                     rrp_gbp=rrp_gbp,
                     has_amazon_prime=has_amazon_prime,
+                    expected_name=name,
                 )
                 if verified is not None:
+                    verified_dp = True
                     offers[0] = verified
                     offers.sort(key=lambda o: o.total_gbp)
                     best = offers[0]
@@ -1470,9 +1475,9 @@ async def find_best_uk_offer(
                         return None, [*notes, "Amazon UK: out of stock on product page"]
                     best = offers[0]
         except Exception:
-            pass  # Fail open to search-card offer if /dp/ check times out
+            pass  # Fail open to search-card offer if /dp/ check times out, but do not cache unverified ASIN
 
-    if clean_num and best.retailer == UKRetailer.AMAZON_UK and "/dp/" in best.url:
+    if verified_dp and clean_num and best.retailer == UKRetailer.AMAZON_UK and "/dp/" in best.url:
         _AMAZON_DP_URL_CACHE[clean_num] = best.url
         if on_amazon_dp_url_update is not None:
             on_amazon_dp_url_update(clean_num, best.url)

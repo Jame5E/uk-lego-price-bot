@@ -57,6 +57,27 @@ def test_deal_filter_blocks_wall_mounts_lights_and_outliers():
     assert not is_valid_lego_set_listing("Acrylic Display Case for 42171", "42171", 89.99, 189.99)
     assert not is_valid_lego_set_listing("LEGO 42171 Technic Set - Pre-owned Incomplete", "42171", 120.00, 189.99)
     assert not is_valid_lego_set_listing("LEGO 42171 Technic Set", "42171", 45.00, 189.99)
+    assert not is_valid_lego_set_listing(
+        "LEGO Ideas Mineral Collection 21362", "21361", 48.95, 89.99, expected_name="Gremlins: Gizmo"
+    )
+    assert is_valid_lego_set_listing(
+        "LEGO Ideas Gremlins: Gizmo 21361 Building Set", "21361", 69.99, 89.99, expected_name="Gremlins: Gizmo"
+    )
+
+
+def test_amazon_search_rejects_wrong_set_when_number_only_in_card_text():
+    html = """
+    <html><body>
+      <span id="glow-ingress-line2">United Kingdom</span>
+      <div data-component-type="s-search-result" data-asin="B0DWDRWJ2P">
+        <span>Amazon's Choice for lego 21361</span>
+        <h2>LEGO Ideas Mineral Collection 21362</h2>
+        <span class="a-price"><span class="a-offscreen">£48.95</span></span>
+      </div>
+    </body></html>
+    """
+    offers = parse_amazon_uk_search_html(html, "21361", rrp_gbp=89.99, expected_name="Gremlins: Gizmo")
+    assert offers == []
 
 
 def test_build_uk_search_urls_covers_approved_eight_retailers():

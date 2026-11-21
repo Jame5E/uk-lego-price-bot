@@ -45,6 +45,49 @@ REJECTED_TITLE_PHRASES: tuple[str, ...] = (
     "compatible with lego",
     "moc ",
     " moc",
+    "display box",
+    "protective case",
+)
+
+_STOP_NAME_WORDS: frozenset[str] = frozenset(
+    {
+        "lego",
+        "set",
+        "sets",
+        "icons",
+        "ideas",
+        "star",
+        "wars",
+        "technic",
+        "creator",
+        "city",
+        "marvel",
+        "disney",
+        "harry",
+        "potter",
+        "ninjago",
+        "friends",
+        "speed",
+        "champions",
+        "architecture",
+        "classic",
+        "duplo",
+        "minecraft",
+        "lord",
+        "rings",
+        "the",
+        "and",
+        "for",
+        "with",
+        "from",
+        "model",
+        "collection",
+        "edition",
+        "building",
+        "blocks",
+        "adults",
+        "kids",
+    }
 )
 
 
@@ -53,6 +96,8 @@ def is_valid_lego_set_listing(
     set_number: str | None,
     price_gbp: float,
     rrp_gbp: float | None = None,
+    *,
+    expected_name: str | None = None,
 ) -> bool:
     """Validate that a product title & price represent a genuine, complete, brand-new LEGO set."""
     if price_gbp < 5.0:
@@ -62,10 +107,16 @@ def is_valid_lego_set_listing(
     if not clean_title.strip():
         return False
 
+    if "lego" not in clean_title:
+        return False
+
     if set_number:
         clean_num = set_number.strip().split("-")[0]
-        if clean_num and not re.search(rf"\b{re.escape(clean_num)}\b", clean_title):
-            return False
+        if clean_num:
+            if not re.search(rf"\b{re.escape(clean_num)}\b", clean_title):
+                return False
+            if re.search(rf"\b(?:for|fits)\s+(?:lego\s+)?{re.escape(clean_num)}\b", clean_title):
+                return False
 
     for phrase in REJECTED_TITLE_PHRASES:
         if phrase in clean_title:
@@ -75,9 +126,12 @@ def is_valid_lego_set_listing(
     if re.search(r"\bfor\s+lego\b", clean_title):
         return False
 
-    # Reject generic "building blocks" knockoffs that omit the LEGO brand
-    if "building blocks" in clean_title and "lego" not in clean_title:
-        return False
+    if expected_name:
+        tokens = [
+            w for w in re.findall(r"[a-z]{4,}", expected_name.lower()) if w not in _STOP_NAME_WORDS
+        ]
+        if tokens and not any(re.search(rf"\b{re.escape(tok)}", clean_title) for tok in tokens):
+            return False
 
     if rrp_gbp is not None and rrp_gbp > 0:
         min_plausible = max(5.0, round(rrp_gbp * 0.40, 2))
