@@ -585,154 +585,168 @@ class LegoTrackerBot(discord.Client):
 
         async def _check_one(idx: int, item: TrackedItem) -> None:
             async with sem:
-                if len(items) > 1 and idx > 0:
-                    await asyncio.sleep(random.uniform(1.5, 3.0))
+                try:
+                    if len(items) > 1 and idx > 0:
+                        await asyncio.sleep(random.uniform(1.5, 3.0))
 
-                status_msg: Optional[discord.Message] = None
-                if scheduled and isinstance(channel, discord.abc.Messageable):
-                    status_msg = await self._get_status_message(channel)
+                    status_msg: Optional[discord.Message] = None
+                    if scheduled and isinstance(channel, discord.abc.Messageable):
+                        status_msg = await self._get_status_message(channel)
 
-                async def _update_status(text: str) -> None:
-                    if status_msg is not None:
-                        try:
-                            await status_msg.edit(
-                                content=self._format_status_text(text),
-                                allowed_mentions=discord.AllowedMentions.none(),
+                    async def _update_status(text: str) -> None:
+                        if status_msg is not None:
+                            try:
+                                await status_msg.edit(
+                                    content=self._format_status_text(text),
+                                    allowed_mentions=discord.AllowedMentions.none(),
+                                )
+                            except Exception:
+                                pass
+
+                    await _update_status(f"🔍 Checking **{format_item_title(item)}** for UK deals...")
+
+                    refreshed, was_retired = await self._refresh_item_metadata(item, channel, now_mono)
+                    if was_retired or refreshed is None:
+                        return
+                    item = refreshed
+
+                    best_offer, notes = await self._fetch_offer(
+                        item,
+                        scheduled=scheduled,
+                        force_refresh=force_refresh,
+                        interactive_serp_budget=interactive_serp_budget,
+                    )
+                    self.db.mark_checked(item.id)
+
+                    title = format_item_title(item)
+                    box_art = item.image_url or default_box_art_url(item.set_number)
+                    blocked_notes = [
+                        n for n in notes
+                        if any(tok in n.lower() for tok in ("rate-limited", "cooldown", "http ", "timeout", "error"))
+                    ]
+
+                    if best_offer is None:
+                        latest = self.db.get_latest_price(item.id) if not scheduled and not force_refresh else None
+                        rec_retailer = UKRetailer.OTHER
+                        if latest is not None:
+                            try:
+                                rec_retailer = UKRetailer(latest.retailer)
+                            except ValueError:
+                                rec_retailer = UKRetailer.OTHER
+
+                        if latest is not None and rec_retailer in APPROVED_UK_RETAILERS:
+                            eff_rrp = item.rrp_gbp if item.rrp_gbp > 0 else latest.price_gbp
+                            hist_totals = [h.total_gbp for h in self.db.get_price_history(item.id, limit=90)]
+                            cached_analysis = analyze_price(
+                                rrp_gbp=eff_rrp,
+                                item_price_gbp=latest.price_gbp,
+                                shipping_gbp=latest.shipping_gbp,
+                                historical_totals_gbp=hist_totals,
+                                is_retiring=item.is_retiring,
                             )
-                        except Exception:
-                            pass
+                            fallback_url = item.url if item.url and detect_retailer_from_url(item.url) == rec_retailer else None
+                            if not fallback_url and rec_retailer == UKRetailer.AMAZON_UK and item.set_number:
+                                fallback_url = self.db.get_amazon_dp_urls().get(item.set_number.strip().split("-")[0])
+                            if not fallback_url and item.set_number:
+                                resolved_name = clean_set_display_name(item.name, item.set_number) or item.name
+                                fallback_url = dict(build_uk_search_urls(resolved_name, item.set_number)).get(rec_retailer)
+                            embeds = build_price_card(
+                                item,
+                                cached_analysis,
+                                rec_retailer,
+                                mode="cached",
+                                offer_url=fallback_url or item.url,
+                                recorded_at=latest.recorded_at,
+                                excluded_notes=blocked_notes,
+                            )
+                            await _emit(
+                                embeds[0],
+                                item.set_number,
+                                deal_url=fallback_url or item.url,
+                                retailer_name=rec_retailer.display_name,
+                            )
+                            return
 
-                await _update_status(f"🔍 Checking **{format_item_title(item)}** for UK deals...")
-
-                refreshed, was_retired = await self._refresh_item_metadata(item, channel, now_mono)
-                if was_retired or refreshed is None:
-                    return
-                item = refreshed
-
-                best_offer, notes = await self._fetch_offer(
-                    item,
-                    scheduled=scheduled,
-                    force_refresh=force_refresh,
-                    interactive_serp_budget=interactive_serp_budget,
-                )
-                self.db.mark_checked(item.id)
-
-                title = format_item_title(item)
-                box_art = item.image_url or default_box_art_url(item.set_number)
-                blocked_notes = [
-                    n for n in notes
-                    if any(tok in n.lower() for tok in ("rate-limited", "cooldown", "http ", "timeout", "error"))
-                ]
-
-                if best_offer is None:
-                    latest = self.db.get_latest_price(item.id) if not scheduled and not force_refresh else None
-                    rec_retailer = UKRetailer.OTHER
-                    if latest is not None:
-                        try:
-                            rec_retailer = UKRetailer(latest.retailer)
-                        except ValueError:
-                            rec_retailer = UKRetailer.OTHER
-
-                    if latest is not None and rec_retailer in APPROVED_UK_RETAILERS:
-                        eff_rrp = item.rrp_gbp if item.rrp_gbp > 0 else latest.price_gbp
-                        hist_totals = [h.total_gbp for h in self.db.get_price_history(item.id, limit=90)]
-                        cached_analysis = analyze_price(
-                            rrp_gbp=eff_rrp,
-                            item_price_gbp=latest.price_gbp,
-                            shipping_gbp=latest.shipping_gbp,
-                            historical_totals_gbp=hist_totals,
-                            is_retiring=item.is_retiring,
-                        )
-                        fallback_url = item.url if item.url and detect_retailer_from_url(item.url) == rec_retailer else None
-                        if not fallback_url and rec_retailer == UKRetailer.AMAZON_UK and item.set_number:
-                            fallback_url = self.db.get_amazon_dp_urls().get(item.set_number.strip().split("-")[0])
-                        if not fallback_url and item.set_number:
-                            resolved_name = clean_set_display_name(item.name, item.set_number) or item.name
-                            fallback_url = dict(build_uk_search_urls(resolved_name, item.set_number)).get(rec_retailer)
-                        embeds = build_price_card(
-                            item,
-                            cached_analysis,
-                            rec_retailer,
-                            mode="cached",
-                            offer_url=fallback_url or item.url,
-                            recorded_at=latest.recorded_at,
-                            excluded_notes=blocked_notes,
-                        )
+                        rrp_line = f"💷 **Normal RRP:** £{item.rrp_gbp:.2f}\n" if item.rrp_gbp > 0 else ""
+                        diag = "\n".join(f"• {n}" for n in notes[:5]) if notes else "No approved UK retailers had stock."
                         await _emit(
-                            embeds[0],
+                            make_status_embed(
+                                f"🧩 {title}",
+                                f"{rrp_line}⚠️ **No live in-stock UK offers found right now**\n*Sources checked:*\n{diag}",
+                                color=discord.Color.orange(),
+                                thumbnail_url=box_art,
+                                footer="Checked approved UK retailers • GBP (£) inc. delivery",
+                            ),
                             item.set_number,
-                            deal_url=fallback_url or item.url,
-                            retailer_name=rec_retailer.display_name,
                         )
+                        await _update_status(f"ℹ️ **{title}** had no good deals *(no in-stock UK offers found)*.")
                         return
 
-                    rrp_line = f"💷 **Normal RRP:** £{item.rrp_gbp:.2f}\n" if item.rrp_gbp > 0 else ""
-                    diag = "\n".join(f"• {n}" for n in notes[:5]) if notes else "No approved UK retailers had stock."
-                    await _emit(
-                        make_status_embed(
-                            f"🧩 {title}",
-                            f"{rrp_line}⚠️ **No live in-stock UK offers found right now**\n*Sources checked:*\n{diag}",
-                            color=discord.Color.orange(),
-                            thumbnail_url=box_art,
-                            footer="Checked approved UK retailers • GBP (£) inc. delivery",
-                        ),
-                        item.set_number,
+                    rrp = item.rrp_gbp if item.rrp_gbp > 0 else best_offer.item_price_gbp
+                    prev_low = self.db.get_historical_low(item.id)
+                    is_all_time_low = prev_low is not None and best_offer.total_gbp < prev_low
+
+                    history = self.db.get_price_history(item.id, limit=90)
+                    hist_totals = [h.total_gbp for h in history]
+                    if best_offer.historical_low_gbp is not None:
+                        hist_totals.append(best_offer.historical_low_gbp)
+                    if best_offer.historical_avg_gbp is not None:
+                        hist_totals.append(best_offer.historical_avg_gbp)
+
+                    self.db.record_price(
+                        item.id,
+                        best_offer.item_price_gbp,
+                        best_offer.shipping_gbp,
+                        best_offer.total_gbp,
+                        best_offer.retailer.value,
                     )
-                    await _update_status(f"ℹ️ **{title}** had no good deals *(no in-stock UK offers found)*.")
-                    return
 
-                rrp = item.rrp_gbp if item.rrp_gbp > 0 else best_offer.item_price_gbp
-                prev_low = self.db.get_historical_low(item.id)
-                is_all_time_low = prev_low is not None and best_offer.total_gbp < prev_low
+                    analysis = analyze_price(
+                        rrp_gbp=rrp,
+                        item_price_gbp=best_offer.item_price_gbp,
+                        shipping_gbp=best_offer.shipping_gbp,
+                        historical_totals_gbp=hist_totals,
+                        is_retiring=item.is_retiring,
+                    )
 
-                history = self.db.get_price_history(item.id, limit=90)
-                hist_totals = [h.total_gbp for h in history]
-                if best_offer.historical_low_gbp is not None:
-                    hist_totals.append(best_offer.historical_low_gbp)
-                if best_offer.historical_avg_gbp is not None:
-                    hist_totals.append(best_offer.historical_avg_gbp)
+                    embeds = build_price_card(
+                        item,
+                        analysis,
+                        best_offer.retailer,
+                        mode="check",
+                        shipping_note=best_offer.shipping_note,
+                        offer_url=best_offer.url,
+                        excluded_notes=blocked_notes,
+                        is_all_time_low=is_all_time_low,
+                    )
+                    await _emit(
+                        embeds[0],
+                        item.set_number,
+                        deal_url=best_offer.url,
+                        retailer_name=best_offer.retailer.display_name,
+                    )
 
-                self.db.record_price(
-                    item.id,
-                    best_offer.item_price_gbp,
-                    best_offer.shipping_gbp,
-                    best_offer.total_gbp,
-                    best_offer.retailer.value,
-                )
-
-                analysis = analyze_price(
-                    rrp_gbp=rrp,
-                    item_price_gbp=best_offer.item_price_gbp,
-                    shipping_gbp=best_offer.shipping_gbp,
-                    historical_totals_gbp=hist_totals,
-                    is_retiring=item.is_retiring,
-                )
-
-                embeds = build_price_card(
-                    item,
-                    analysis,
-                    best_offer.retailer,
-                    mode="check",
-                    shipping_note=best_offer.shipping_note,
-                    offer_url=best_offer.url,
-                    excluded_notes=blocked_notes,
-                    is_all_time_low=is_all_time_low,
-                )
-                await _emit(
-                    embeds[0],
-                    item.set_number,
-                    deal_url=best_offer.url,
-                    retailer_name=best_offer.retailer.display_name,
-                )
-
-                await self._notify_if_deal(
-                    item,
-                    analysis,
-                    best_offer,
-                    is_all_time_low=is_all_time_low,
-                    channel=channel,
-                    update_status=_update_status,
-                )
+                    await self._notify_if_deal(
+                        item,
+                        analysis,
+                        best_offer,
+                        is_all_time_low=is_all_time_low,
+                        channel=channel,
+                        update_status=_update_status,
+                    )
+                except Exception as exc:
+                    logger.exception("Price check failed for %s", format_item_title(item))
+                    if not scheduled:
+                        try:
+                            await _emit(
+                                make_error_embed(
+                                    f"Check Failed: {format_item_title(item)}",
+                                    f"Could not check this set right now (`{type(exc).__name__}: {str(exc)[:180]}`).",
+                                ),
+                                item.set_number,
+                            )
+                        except Exception:
+                            logger.exception("Failed to emit per-item error embed")
 
         await asyncio.gather(*(_check_one(idx, it) for idx, it in enumerate(items)))
         self._save_cooldowns()
@@ -1005,7 +1019,7 @@ class LegoTrackerBot(discord.Client):
                 await interaction.followup.send(
                     embed=make_error_embed(
                         "Price Check Error",
-                        f"Something went wrong while checking UK stores (`{type(exc).__name__}`). Please try again.",
+                        f"Something went wrong while checking UK stores (`{type(exc).__name__}: {str(exc)[:180]}`). Please try again.",
                     )
                 )
 
