@@ -1000,10 +1000,13 @@ class LegoTrackerBot(discord.Client):
                 await interaction.followup.send(
                     embed=make_error_embed("Price Check Timed Out", "UK retailers took too long to respond (>5m). Please try again.")
                 )
-            except Exception:
+            except Exception as exc:
                 logger.exception("check command failed")
                 await interaction.followup.send(
-                    embed=make_error_embed("Price Check Error", "Something went wrong while checking UK stores. Please try again.")
+                    embed=make_error_embed(
+                        "Price Check Error",
+                        f"Something went wrong while checking UK stores (`{type(exc).__name__}`). Please try again.",
+                    )
                 )
 
         @self.tree.command(name="edit", description="Edit alert settings for a tracked LEGO set")

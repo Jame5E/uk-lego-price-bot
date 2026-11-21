@@ -170,9 +170,14 @@ def build_price_card(
         f"📍 **{retailer.display_name}**{seller_suffix} — {ship_txt}"
     )
 
+    safe_embed_url = (
+        link_url.strip()
+        if link_url and (link_url.strip().startswith("https://") or link_url.strip().startswith("http://")) and len(link_url.strip()) <= 2048
+        else None
+    )
     embed = discord.Embed(
-        title=f"🧩 {title}",
-        url=link_url or None,
+        title=f"🧩 {title}"[:256],
+        url=safe_embed_url,
         description=headline,
         color=color,
     )

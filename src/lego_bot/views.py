@@ -20,19 +20,30 @@ if TYPE_CHECKING:
     from .bot import LegoTrackerBot
 
 
+def _valid_link_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    cleaned = url.strip()
+    if (cleaned.startswith("https://") or cleaned.startswith("http://")) and len(cleaned) <= 512:
+        return cleaned
+    return None
+
+
 class DealLinkView(discord.ui.View):
     """Native link button attached to deal alerts."""
 
     def __init__(self, url: str, retailer_name: str) -> None:
         super().__init__(timeout=None)
-        self.add_item(
-            discord.ui.Button(
-                label=f"View at {retailer_name}",
-                emoji="🛒",
-                style=discord.ButtonStyle.link,
-                url=url,
+        safe_url = _valid_link_url(url)
+        if safe_url:
+            self.add_item(
+                discord.ui.Button(
+                    label=f"View at {retailer_name}"[:80],
+                    emoji="🛒",
+                    style=discord.ButtonStyle.link,
+                    url=safe_url,
+                )
             )
-        )
 
 
 class _PingUserSelect(discord.ui.UserSelect):
@@ -247,13 +258,14 @@ class CheckResultView(discord.ui.View):
         super().__init__(timeout=600)
         self.bot = bot
         self.set_number = set_number
-        if deal_url:
+        safe_url = _valid_link_url(deal_url)
+        if safe_url:
             self.add_item(
                 discord.ui.Button(
-                    label=f"View at {retailer_name or 'Store'}",
+                    label=f"View at {retailer_name or 'Store'}"[:80],
                     emoji="🛒",
                     style=discord.ButtonStyle.link,
-                    url=deal_url,
+                    url=safe_url,
                 )
             )
         if not set_number:
